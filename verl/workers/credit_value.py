@@ -32,6 +32,12 @@ prefix_entropy_features = _metadata.prefix_entropy_features
 
 
 _DEFAULTS = {
+    "prediction_mode": "entropy_aware",
+    "semantic_min_val_prefixes": 32,
+    "semantic_min_val_questions": 8,
+    "semantic_min_val_per_class": 8,
+    "semantic_min_val_auc": 0.55,
+    "semantic_min_brier_improvement": 0.0,
     "device": "cpu",
     "torch_dtype": "float32",
     "attn_implementation": "sdpa",
@@ -70,6 +76,9 @@ _DEFAULTS = {
 }
 _STRUCTURAL_DIM = 8
 _CHECKPOINT_VERSION = 2
+_PAIRED_TRAINING_PROTOCOL = "paired_nonterminal_v1"
+_SEMANTIC_TRAINING_PROTOCOL = "semantic_nonterminal_v1"
+_SEMANTIC_METADATA_SCHEMA = "complete-action-metadata-v1"
 
 
 class EntropyValueHead(nn.Module):
@@ -85,8 +94,17 @@ class EntropyValueHead(nn.Module):
         self.absolute = residual(len(ABS_FEATURE_NAMES))
         self.temporal = residual(len(ABS_FEATURE_NAMES) + len(TEMP_FEATURE_NAMES))
 
-    def forward(self, features, absolute, temporal, abs_mask, temp_mask, no_entropy=False, no_temporal=False):
-        if no_entropy:
+    def forward(self, features, absolute, temporal, abs_mask, temp_mask, no_entropy=False, no_temporal=False,
+                preserve_entropy_metadata=False):
+        if preserve_entropy_metadata and (no_entropy or no_temporal):
+            # The paired ablation changes entropy numbers only. Length, coverage,
+            # validity and history availability remain identical in every arm.
+            temporal = temporal.clone()
+            temporal[:, [0, 1, 2, 3, 6, 7, 8, 9]] = 0
+            if no_entropy:
+                absolute = absolute.clone()
+                absolute[:, [0, 6]] = 0
+        elif no_entropy:
             absolute, temporal = torch.zeros_like(absolute), torch.zeros_like(temporal)
         elif no_temporal:
             temporal = torch.zeros_like(temporal)
@@ -158,6 +176,7 @@ class PrefixValueScorer:
     def __init__(self, config: dict):
         self.config = {**_DEFAULTS, **dict(config)}
         self._validate_config()
+        self.prediction_mode = self.config["prediction_mode"]
         self.device = torch.device(self.config["device"])
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("Prefix value scorer requested CUDA, but CUDA is unavailable")
@@ -211,6 +230,10 @@ class PrefixValueScorer:
         self.deployment_mode = "absolute_bootstrap" if self.config["allow_absolute_only_pretrain"] else "full"
         self.pretraining_mode = "absolute" if self.config["allow_absolute_only_pretrain"] else "full"
         self._absolute_pretrain_active = False
+        # Checkpoint-owned opt-in: existing qualified checkpoints keep their
+        # original training/ablation behavior unless explicitly warm-started.
+        self.training_protocol = "legacy"
+        self.warm_started = False
         self.reliability = {"solver": 0.0, "verifier": 0.0}
         self.temporal_reliability = {"solver": 0.0, "verifier": 0.0}
         self.ready = False
@@ -219,8 +242,34 @@ class PrefixValueScorer:
         self.last_metrics: dict = {}
         self.frozen_parameters = sum(parameter.numel() for parameter in self.encoder.parameters())
         self.head_parameters = sum(parameter.numel() for parameter in self.candidate_head.parameters())
+        self.semantic_reliability = {"solver": 0.0, "verifier": 0.0}
+        self.semantic_validation_fingerprints = {"solver": None, "verifier": None}
+        self.startup_semantic_report = {}
+        if self.prediction_mode == "semantic_only":
+            self._configure_semantic_training()
+
+    def _configure_semantic_training(self):
+        self.training_protocol = _SEMANTIC_TRAINING_PROTOCOL
+        self.deployment_mode = "semantic_only"
+        self.candidate_head.requires_grad_(False)
+        self.candidate_head.semantic.requires_grad_(True)
+        for head in (self.encoder, self.deployed_head, self.control_head, self.temporal_control_head):
+            head.eval().requires_grad_(False)
+        self.optimizer = torch.optim.AdamW(self.candidate_head.semantic.parameters(),
+                                          lr=float(self.config["learning_rate"]),
+                                          weight_decay=float(self.config["weight_decay"]))
 
     def _validate_config(self) -> None:
+        if self.config["prediction_mode"] not in ("entropy_aware", "semantic_only"):
+            raise ValueError("prediction_mode must be entropy_aware or semantic_only")
+        for name in ("semantic_min_val_prefixes", "semantic_min_val_questions", "semantic_min_val_per_class"):
+            value = self.config[name]
+            if isinstance(value, bool) or not math.isfinite(float(value)) or int(value) != float(value) or int(value) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if not math.isfinite(float(self.config["semantic_min_val_auc"])) or not 0 <= float(self.config["semantic_min_val_auc"]) <= 1:
+            raise ValueError("semantic_min_val_auc must be finite and in [0, 1]")
+        if not math.isfinite(float(self.config["semantic_min_brier_improvement"])) or float(self.config["semantic_min_brier_improvement"]) < 0:
+            raise ValueError("semantic_min_brier_improvement must be finite and nonnegative")
         if not isinstance(self.config["allow_absolute_only_pretrain"], bool):
             raise ValueError("allow_absolute_only_pretrain must be boolean")
         if not self.config.get("model_path"):
@@ -326,7 +375,8 @@ class PrefixValueScorer:
     def _encode(self, record):
         try:
             segments, states = self._segments_and_states(record)
-            entropy = prefix_entropy_features(record["actions"], float(self.config["min_entropy_coverage"]))
+            entropy = (prefix_entropy_features(record["actions"], float(self.config["min_entropy_coverage"]))
+                       if self.prediction_mode == "entropy_aware" else None)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise _InvalidRecord(str(error)) from error
         token_ids, boundaries = [], []
@@ -356,13 +406,23 @@ class PrefixValueScorer:
         features = torch.cat((semantic.clone(), torch.tensor(states[:count], dtype=torch.float32)), -1).half().contiguous()
         if not bool(torch.isfinite(features).all()):
             raise RuntimeError("nonfinite encoder features")
+        action_ok = [True]
+        for action in record["actions"][:count - 1]:
+            response_tokens = action.get("response_token_count", action.get("entropy_token_count"))
+            if response_tokens is None:
+                response_tokens = len(self.tokenizer.encode(str(action["text"]), add_special_tokens=False))
+            action_ok.append(bool(_metadata._binary(action.get("valid", True))
+                                  and not _metadata._binary(action.get("truncated", False))
+                                  and math.isfinite(float(response_tokens)) and float(response_tokens) > 0))
         return {"features": features,
-                "absolute": torch.from_numpy(entropy["absolute"][:count]).clone(),
-                "temporal": torch.from_numpy(entropy["temporal"][:count]).clone(),
-                "abs_mask": torch.from_numpy(entropy["absolute_available"][:count]).clone(),
-                "temp_mask": torch.from_numpy(entropy["temporal_available"][:count]).clone(),
+                "absolute": torch.from_numpy(entropy["absolute"][:count]).clone() if entropy else torch.zeros(count, len(ABS_FEATURE_NAMES)),
+                "temporal": torch.from_numpy(entropy["temporal"][:count]).clone() if entropy else torch.zeros(count, len(TEMP_FEATURE_NAMES)),
+                "abs_mask": torch.from_numpy(entropy["absolute_available"][:count]).clone() if entropy else torch.zeros(count, dtype=torch.bool),
+                "temp_mask": torch.from_numpy(entropy["temporal_available"][:count]).clone() if entropy else torch.zeros(count, dtype=torch.bool),
                 "prefix_roles": ["initial"] + [a["role"].lower() for a in record["actions"][:count - 1]],
-                "prefix_terminal": torch.tensor([bool(s[6]) for s in states[:count]])}, total
+                "prefix_terminal": torch.tensor([bool(s[6]) for s in states[:count]]),
+                "semantic_metadata_schema": _SEMANTIC_METADATA_SCHEMA,
+                "semantic_available": torch.tensor(action_ok, dtype=torch.bool)}, total
 
     @staticmethod
     def _flatten(rows):
@@ -410,14 +470,45 @@ class PrefixValueScorer:
             result[key] = x
         return result
 
+    def _control_training_data(self, data):
+        """Use the same own-role, nonterminal entropy domain for fit and serving."""
+        if self.training_protocol != _PAIRED_TRAINING_PROTOCOL:
+            return data
+        roles = data.get("roles", data.get("prefix_roles"))
+        if roles is None or len(roles) != len(data["features"]):
+            raise ValueError("paired entropy training requires prefix roles")
+        nonterminal = ~data["prefix_terminal"].bool()
+        own_abs = torch.tensor([bool(data["absolute"][i, (0 if role == "solver" else 6) + 5])
+                                if role in ("solver", "verifier") else False
+                                for i, role in enumerate(roles)], dtype=torch.bool)
+        own_temp = torch.tensor([bool(data["temporal"][i, (0 if role == "solver" else 6) + 5])
+                                 if role in ("solver", "verifier") else False
+                                 for i, role in enumerate(roles)], dtype=torch.bool)
+        return {**data, "abs_mask": nonterminal & own_abs,
+                "temp_mask": nonterminal & own_abs & own_temp}
+
     def _predict(self, head, data, no_entropy=False, no_temporal=False):
+        data = self._control_training_data(data)
         head.eval()
         scores = []
         with torch.inference_mode():
             for start in range(0, len(data["features"]), int(self.config["train_batch_size"])):
                 batch = self._batch(data, slice(start, start + int(self.config["train_batch_size"])))
-                scores.append(torch.sigmoid(head(**batch, no_entropy=no_entropy, no_temporal=no_temporal)).cpu())
+                scores.append(torch.sigmoid(head(
+                    **batch, no_entropy=no_entropy, no_temporal=no_temporal,
+                    preserve_entropy_metadata=self.training_protocol == _PAIRED_TRAINING_PROTOCOL)).cpu())
         return torch.cat(scores).clone()
+
+    def _predict_semantic(self, head, data):
+        """No residual forward, entropy scaling or entropy masks in this path."""
+        head.semantic.eval()
+        result = []
+        size = int(self.config["train_batch_size"])
+        with torch.inference_mode():
+            for start in range(0, len(data["features"]), size):
+                features = data["features"][start:start + size].to(self.device, dtype=torch.float32)
+                result.append(torch.sigmoid(head.semantic(features).squeeze(-1)).cpu())
+        return torch.cat(result).clone() if result else torch.empty(0)
 
     @staticmethod
     def _route_predictions(scores, data, temporal_permissions):
@@ -439,6 +530,8 @@ class PrefixValueScorer:
         return result
 
     def _deployment_stage(self):
+        if self.prediction_mode == "semantic_only":
+            return "semantic_only"
         if self.deployment_mode == "full":
             return "full"
         enabled = sum(float(value) > 0 for value in self.temporal_reliability.values())
@@ -446,7 +539,13 @@ class PrefixValueScorer:
 
     def _deployment_metrics(self):
         return {"deployment_stage": self._deployment_stage(), "pretraining_mode": self.pretraining_mode,
+                "prediction_mode": self.prediction_mode,
+                "semantic_only": float(self.prediction_mode == "semantic_only"),
+                "semantic_ready": float(self.prediction_mode == "semantic_only" and self.ready),
+                **{"semantic_reliability_" + role: value for role, value in self.semantic_reliability.items()},
                 "absolute_bootstrap_mode": float(self.deployment_mode == "absolute_bootstrap"),
+                "warm_started": float(self.warm_started),
+                "paired_entropy_training": float(self.training_protocol == _PAIRED_TRAINING_PROTOCOL),
                 "deployment_temporal_roles": sum(float(value) > 0 for value in self.temporal_reliability.values())}
 
     def prepare(self, records):
@@ -476,8 +575,20 @@ class PrefixValueScorer:
                 continue
             n = len(row["features"])
             partial += int(n < len(record["actions"]) + 1)
-            if self.ready:
+            if self.ready and self.prediction_mode == "semantic_only":
+                prediction = self._predict_semantic(self.deployed_head, row)
+                available = self._semantic_mask(row, include_initial=True)
+                values[uid] = [
+                    {"sem": float(score), "control_value": float(score), "prediction_source": "semantic_only",
+                     "semantic_available": bool(available[i]) and math.isfinite(float(score)),
+                     "action_semantic_available": bool(i and available[i]) and math.isfinite(float(score)),
+                     "absolute_available": False, "temporal_available": False,
+                     "action_absolute_available": False, "action_temporal_available": False}
+                    for i, score in enumerate(prediction)
+                ]
+            elif self.ready:
                 prediction = self._predict(self.deployed_head, row)
+                control_row = self._control_training_data(row)
                 if self.deployment_mode == "absolute_bootstrap":
                     prediction = self._route_predictions(prediction, row, self.temporal_reliability)
                 if not bool(torch.isfinite(prediction).all()):
@@ -486,10 +597,12 @@ class PrefixValueScorer:
                 for i, score in enumerate(prediction):
                     offset = 0 if row["prefix_roles"][i] == "solver" else 6
                     values[uid].append(dict(zip(("sem", "abs", "full"), score.tolist()),
-                                            absolute_available=bool(row["abs_mask"][i]),
-                                            temporal_available=bool(row["temp_mask"][i]),
-                                            action_absolute_available=bool(i and row["absolute"][i, offset + 5]),
-                                            action_temporal_available=bool(i and row["temporal"][i, offset + 5])))
+                                            absolute_available=bool(control_row["abs_mask"][i]),
+                                            temporal_available=bool(control_row["temp_mask"][i]),
+                                            action_absolute_available=bool(i and row["absolute"][i, offset + 5]
+                                                                           and control_row["abs_mask"][i]),
+                                            action_temporal_available=bool(i and row["temporal"][i, offset + 5]
+                                                                           and control_row["temp_mask"][i])))
             if train_eligible:
                 self._pending[uid] = {**row, "traj_uid": uid, "question_key": qkey, "label": label}
                 self._pending.move_to_end(uid)
@@ -507,11 +620,15 @@ class PrefixValueScorer:
                    "pending_trajectories": len(self._pending), "frozen_parameters": self.frozen_parameters,
                    "head_parameters": self.head_parameters,
                    "matched_control_parameters": 2 * self.head_parameters,
-                   "trainable_head_parameters": 3 * self.head_parameters}
+                   "trainable_head_parameters": (sum(p.numel() for p in self.candidate_head.semantic.parameters())
+                                                 if self.prediction_mode == "semantic_only" else 3 * self.head_parameters)}
         metrics.update(self._deployment_metrics())
         metrics.update({"reliability_" + role: value for role, value in self.reliability.items()})
         metrics.update({"temporal_reliability_" + role: value for role, value in self.temporal_reliability.items()})
-        return {"ready": self.ready, "version": self.version, "values": values,
+        return {"ready": self.ready, "version": self.version, "values": values, "warm_started": self.warm_started,
+                "prediction_mode": self.prediction_mode, "semantic_ready": self.prediction_mode == "semantic_only" and self.ready,
+                "semantic_reliability": self.semantic_reliability.copy(),
+                "startup_semantic_report": copy.deepcopy(self.startup_semantic_report),
                 "reliability": self.reliability.copy(), "temporal_reliability": self.temporal_reliability.copy(), "metrics": metrics}
 
     def _train(self, rows, epochs, stage="all", control=False):
@@ -527,7 +644,11 @@ class PrefixValueScorer:
             return self._train_impl(rows, epochs, stage, control)
 
     def _train_impl(self, rows, epochs, stage="all", control=False):
-        data = self._flatten(rows)
+        if self.prediction_mode == "semantic_only":
+            if control or stage not in ("all", "semantic"):
+                raise ValueError("semantic_only trains only candidate.semantic")
+            return self._train_semantic_impl(rows, epochs)
+        data = self._control_training_data(self._flatten(rows))
         if control == "temporal":
             head, optimizer = self.temporal_control_head, self.temporal_control_optimizer
         elif control:
@@ -550,7 +671,8 @@ class PrefixValueScorer:
             for start in range(0, len(indices), int(self.config["train_batch_size"])):
                 ix = indices[start:start + int(self.config["train_batch_size"])]
                 batch = self._batch(data, ix)
-                logits = head(**batch, no_entropy=control is True, no_temporal=control == "temporal")
+                logits = head(**batch, no_entropy=control is True, no_temporal=control == "temporal",
+                              preserve_entropy_metadata=self.training_protocol == _PAIRED_TRAINING_PROTOCOL)
                 labels = data["labels"][ix].to(self.device)
                 losses = F.binary_cross_entropy_with_logits(logits, labels[:, None].expand_as(logits), reduction="none")
                 mask = torch.stack((torch.ones_like(batch["abs_mask"]), batch["abs_mask"], batch["temp_mask"]), -1)
@@ -668,6 +790,175 @@ class PrefixValueScorer:
         return (self._bootstrap_role_quality(metrics, role)
                 and self._role_temporal_quality(metrics, role))
 
+    @staticmethod
+    def _semantic_mask(row, include_initial=False):
+        """Availability is action metadata, never entropy coverage or a label."""
+        n = len(row["features"])
+        available = row.get("semantic_available")
+        if (row.get("semantic_metadata_schema") != _SEMANTIC_METADATA_SCHEMA
+                or not torch.is_tensor(available) or available.dtype != torch.bool or available.shape != (n,)):
+            return torch.zeros(n, dtype=torch.bool)
+        terminal = row.get("prefix_terminal")
+        roles = row.get("prefix_roles", [])
+        if not torch.is_tensor(terminal) or terminal.shape != (n,) or len(roles) != n:
+            return torch.zeros(n, dtype=torch.bool)
+        mask = available.cpu().clone() & ~terminal.cpu().bool()
+        mask &= torch.tensor([r in ("solver", "verifier") or (include_initial and i == 0 and r == "initial")
+                              for i, r in enumerate(roles)], dtype=torch.bool)
+        return mask
+
+    def _train_semantic_impl(self, rows, epochs):
+        features = torch.cat([r["features"] for r in rows])
+        labels = torch.cat([torch.full((len(r["features"]),), float(r["label"])) for r in rows])
+        self.candidate_head.eval()
+        self.candidate_head.semantic.train()
+        total_loss = total_count = 0.0
+        for _ in range(int(epochs)):
+            indices = torch.randperm(len(labels), generator=self._rng)
+            for start in range(0, len(indices), int(self.config["train_batch_size"])):
+                ix = indices[start:start + int(self.config["train_batch_size"])]
+                logits = self.candidate_head.semantic(features[ix].to(self.device, dtype=torch.float32)).squeeze(-1)
+                loss = F.binary_cross_entropy_with_logits(logits, labels[ix].to(self.device))
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                self.optimizer.step()
+                total_loss += float(loss.detach()) * len(ix)
+                total_count += len(ix)
+        self.candidate_head.eval()
+        return total_loss / total_count if total_count else float("nan")
+
+    def _semantic_row_predictions(self, head, rows):
+        """Stream cached features in bounded CPU/GPU batches, no re-encoding."""
+        size = int(self.config["train_batch_size"])
+        pending, count, scores = [], 0, []
+        for row in rows:
+            features = row["features"]
+            for start in range(0, len(features), size):
+                piece = features[start:start + size]
+                pending.append(piece)
+                count += len(piece)
+                if count >= size:
+                    scores.append(self._predict_semantic(head, {"features": torch.cat(pending)}))
+                    pending, count = [], 0
+        if pending:
+            scores.append(self._predict_semantic(head, {"features": torch.cat(pending)}))
+        return torch.cat(scores).double() if scores else torch.empty(0, dtype=torch.float64)
+
+    def _semantic_priors(self, rows):
+        counts = {key: 0 for key in ("all", "nonterminal", "solver", "verifier")}
+        sums = {key: 0.0 for key in counts}
+        for row in rows:
+            mask = self._semantic_mask(row)
+            scope_counts = {"all": len(row["features"]), "nonterminal": int(mask.sum())}
+            for role in ("solver", "verifier"):
+                scope_counts[role] = sum(bool(mask[i]) for i, r in enumerate(row["prefix_roles"]) if r == role)
+            for key, n in scope_counts.items():
+                counts[key] += n
+                sums[key] += n * float(row["label"])
+        return {key: sums[key] / n if n else float("nan") for key, n in counts.items()}
+
+    def _evaluate_semantic(self, head, rows, train_rows):
+        priors = self._semantic_priors(train_rows)
+        predictions = self._semantic_row_predictions(head, rows)
+        labels = torch.cat([torch.full((len(r["features"]),), float(r["label"]), dtype=torch.float64) for r in rows]) if rows else torch.empty(0, dtype=torch.float64)
+        scope = torch.cat([self._semantic_mask(r) for r in rows]) if rows else torch.empty(0, dtype=torch.bool)
+        roles = [role for row in rows for role in row["prefix_roles"]]
+        errors = (predictions - labels).square()
+
+        def statistics(mask, prior, prefix):
+            n = int(mask.sum())
+            y, p = labels[mask], predictions[mask]
+            finite = bool(torch.isfinite(p).all()) and bool(((p >= 0) & (p <= 1)).all())
+            return {prefix + "prefixes": n,
+                    prefix + "brier": float(errors[mask].mean()) if n and finite else float("nan"),
+                    prefix + "prior_brier": float((y - prior).square().mean()) if n else float("nan"),
+                    prefix + "auc": _weighted_auc(p, y, torch.ones_like(y)) if n and finite else float("nan")}
+
+        result = statistics(torch.ones(len(labels), dtype=torch.bool), priors["all"], "sem_")
+        # Preserve candidate_sem_brier's original all-prefix definition.
+        result["prior_brier"] = result["sem_prior_brier"]
+        result.update(statistics(scope, priors["nonterminal"], "sem_nonterminal_"))
+        for role in ("solver", "verifier"):
+            mask = scope & torch.tensor([r == role for r in roles], dtype=torch.bool)
+            result.update(statistics(mask, priors[role], role + "_sem_"))
+            questions, trajectories, positive, negative = set(), set(), set(), set()
+            for row in rows:
+                own = self._semantic_mask(row)
+                if any(bool(own[i]) for i, r in enumerate(row["prefix_roles"]) if r == role):
+                    questions.add(str(row["question_key"]))
+                    uid = str(row["traj_uid"])
+                    trajectories.add(uid)
+                    (positive if row["label"] == 1 else negative).add(uid)
+            result.update({role + "_sem_questions": len(questions), role + "_sem_trajectories": len(trajectories),
+                           role + "_sem_success_trajectories": len(positive), role + "_sem_failure_trajectories": len(negative)})
+        return result
+
+    def _semantic_role_enough(self, metrics, role):
+        return (metrics[role + "_sem_prefixes"] >= int(self.config["semantic_min_val_prefixes"])
+                and metrics[role + "_sem_questions"] >= int(self.config["semantic_min_val_questions"])
+                and metrics[role + "_sem_success_trajectories"] >= int(self.config["semantic_min_val_per_class"])
+                and metrics[role + "_sem_failure_trajectories"] >= int(self.config["semantic_min_val_per_class"]))
+
+    def _semantic_role_quality(self, metrics, role):
+        auc, brier, prior = (metrics[role + "_sem_" + name] for name in ("auc", "brier", "prior_brier"))
+        return (self._semantic_role_enough(metrics, role)
+                and all(math.isfinite(x) for x in (auc, brier, prior))
+                and auc >= float(self.config["semantic_min_val_auc"])
+                and brier < prior - float(self.config["semantic_min_brier_improvement"]))
+
+    def _validate_semantic_deploy(self, train, val, metrics):
+        candidate = self._evaluate_semantic(self.candidate_head, val, train)
+        metrics.update({"candidate_" + k: v for k, v in candidate.items()})
+        current = self._evaluate_semantic(self.deployed_head, val, train) if self.version else None
+        if current is not None:
+            metrics.update({"deployed_" + k: v for k, v in current.items()})
+        passes = {}
+        for role in self.semantic_reliability:
+            enough = self._semantic_role_enough(candidate, role)
+            passes[role] = self._semantic_role_quality(candidate, role)
+            reason = "qualified" if passes[role] else "insufficient_data" if not enough else "quality_failed"
+            metrics[f"semantic_{role}_qualification"] = reason
+            for label in ("qualified", "insufficient_data", "quality_failed"):
+                metrics[f"semantic_{role}_qualification_{label}"] = float(reason == label)
+            if not enough:
+                continue
+            ids = sorted(str(r["traj_uid"]) for r in val if any(
+                bool(self._semantic_mask(r)[i]) for i, p in enumerate(r["prefix_roles"]) if p == role))
+            fingerprint = hashlib.sha256("\0".join(ids).encode()).hexdigest()
+            if current is not None and fingerprint != self.semantic_validation_fingerprints[role]:
+                self.role_bad_windows[role] = (0 if self._semantic_role_quality(current, role)
+                                               else self.role_bad_windows[role] + 1)
+                if (self.config["disable_miscalibrated"] and self.semantic_reliability[role]
+                        and self.role_bad_windows[role] >= int(self.config["miscalibration_patience"])):
+                    self.semantic_reliability[role] = 0.0
+                    metrics["disabled"] = 1
+            self.semantic_validation_fingerprints[role] = fingerprint
+        # One shared deployed head: never overwrite a still-authorized role's
+        # predictor with unvalidated/worse weights. An unqualified other role
+        # has no veto. Insufficient windows retain the current frozen copy.
+        active = [r for r, permission in self.semantic_reliability.items() if permission]
+        proposed = [r for r, passed in passes.items() if passed]
+        comparator_roles = set(active + proposed)
+        improves = current is None or all(
+            passes[r] and candidate[r + "_sem_brier"] <= current[r + "_sem_brier"] + float(self.config["candidate_brier_tolerance"])
+            for r in comparator_roles if r in active or math.isfinite(current[r + "_sem_brier"]))
+        if proposed and improves:
+            self.deployed_head.semantic.load_state_dict(self.candidate_head.semantic.state_dict())
+            self.deployed_head.eval().requires_grad_(False)
+            self.version += 1
+            self.semantic_reliability = {r: float(passes[r]) for r in passes}
+            self.role_bad_windows = {r: 0 for r in passes}
+            metrics.update(status="deployed", deployed=1)
+        else:
+            metrics["status"] = "candidate_worse" if proposed else "candidate_rejected"
+            if active and any(not self._semantic_role_enough(candidate, r) for r in active):
+                metrics["status"] = "insufficient_data_retained_deployment"
+        self.ready = any(self.semantic_reliability.values())
+        self.reliability = {r: 0.0 for r in self.reliability}
+        self.temporal_reliability = {r: 0.0 for r in self.temporal_reliability}
+        metrics.update({"semantic_bad_windows_" + r: v for r, v in self.role_bad_windows.items()})
+        metrics.update(self._deployment_metrics())
+
     def _ingest(self):
         for uid, row in self._pending.items():
             self._replay[uid] = row
@@ -688,6 +979,8 @@ class PrefixValueScorer:
                 and min(sum(r["label"] == 1 for r in val), sum(r["label"] == 0 for r in val)) >= int(self.config["min_val_per_class"]))
 
     def _validate_deploy(self, train, val, metrics):
+        if self.prediction_mode == "semantic_only":
+            return self._validate_semantic_deploy(train, val, metrics)
         if self.deployment_mode == "absolute_bootstrap":
             return self._validate_bootstrap_deploy(train, val, metrics)
         flattened = self._flatten(train)
@@ -830,6 +1123,14 @@ class PrefixValueScorer:
         train, val = self._ingest()
         if not self._enough(train, val):
             raise ValueError("insufficient distinct training/validation questions or outcome classes for pretraining")
+        if self.prediction_mode == "semantic_only":
+            metrics = {"deployed": 0, "disabled": 0, "train_trajectories": len(train), "val_trajectories": len(val),
+                       "semantic_train_loss": self._train(train, semantic_epochs, "semantic"),
+                       "semantic_train_prefixes": sum(len(r["features"]) for r in train)}
+            self._validate_semantic_deploy(train, val, metrics)
+            metrics.update(ready=float(self.ready), version=self.version)
+            self.last_metrics = metrics
+            return metrics
         self._fit_scaler(train)
         metrics = {"deployed": 0, "disabled": 0, "train_trajectories": len(train), "val_trajectories": len(val)}
         for control in (False, True, "temporal"):
@@ -850,6 +1151,28 @@ class PrefixValueScorer:
         self.last_metrics = metrics
         return metrics
 
+    def _train_paired_online(self, rows, epochs):
+        """Share semantic fitting and pair all nuisance randomness in ablations.
+
+        Entropy residuals retain their respective history across online updates;
+        their semantic base is always the same newly fitted, frozen network.
+        """
+        metrics = {"semantic_train_loss": self._train(rows, epochs, "semantic")}
+        for head in (self.control_head, self.temporal_control_head):
+            head.semantic.load_state_dict(self.candidate_head.semantic.state_dict())
+        paired_rng = self._rng.get_state().clone()
+        next_rng = None
+        for control, name in ((False, "train_loss"), (True, "control_train_loss"),
+                              ("temporal", "temporal_control_train_loss")):
+            self._rng.set_state(paired_rng)
+            metrics[name] = self._train(rows, epochs, "entropy", control)
+            if next_rng is None:
+                next_rng = self._rng.get_state().clone()
+        # All three arms receive identical seeds/permutations. Advance the
+        # serialized stream once, independently of the number of controls.
+        self._rng.set_state(next_rng)
+        return metrics
+
     def update(self):
         """Train only after the actor batch; insufficient data preserves deployment."""
         started = time.perf_counter()
@@ -858,12 +1181,24 @@ class PrefixValueScorer:
         train, val = self._ingest()
         metrics = {"step": self.step, "added_trajectories": added, "train_trajectories": len(train),
                    "val_trajectories": len(val), "deployed": 0, "disabled": 0}
-        if self._enough(train, val):
+        if self.prediction_mode == "semantic_only":
+            enough_train = (len(train) >= int(self.config["min_train_trajectories"])
+                            and len({r["question_key"] for r in train}) >= int(self.config["min_train_questions"]))
+            if enough_train:
+                metrics["semantic_train_loss"] = self._train(train, self.config["train_epochs"], "semantic")
+                metrics["semantic_train_prefixes"] = sum(len(r["features"]) for r in train)
+                self._validate_semantic_deploy(train, val, metrics)
+            else:
+                metrics["status"] = "insufficient_data_retained_deployment"
+        elif self._enough(train, val):
             if self.scaler is None:
                 self._fit_scaler(train)
-            metrics["train_loss"] = self._train(train, self.config["train_epochs"])
-            metrics["control_train_loss"] = self._train(train, self.config["train_epochs"], control=True)
-            metrics["temporal_control_train_loss"] = self._train(train, self.config["train_epochs"], control="temporal")
+            if self.training_protocol == _PAIRED_TRAINING_PROTOCOL:
+                metrics.update(self._train_paired_online(train, self.config["train_epochs"]))
+            else:
+                metrics["train_loss"] = self._train(train, self.config["train_epochs"])
+                metrics["control_train_loss"] = self._train(train, self.config["train_epochs"], control=True)
+                metrics["temporal_control_train_loss"] = self._train(train, self.config["train_epochs"], control="temporal")
             self._validate_deploy(train, val, metrics)
         else:
             metrics["status"] = "insufficient_data_retained_deployment"
@@ -879,9 +1214,14 @@ class PrefixValueScorer:
             raise ValueError("checkpoint path must be a file")
         target.parent.mkdir(parents=True, exist_ok=True)
         state = {"checkpoint_version": _CHECKPOINT_VERSION, "config": copy.deepcopy(self.config),
+                 "prediction_mode": self.prediction_mode, "replay_feature_storage": "raw",
+                 "semantic_reliability": self.semantic_reliability,
+                 "semantic_validation_fingerprints": self.semantic_validation_fingerprints,
+                 "startup_semantic_report": self.startup_semantic_report,
                  "encoder_identity": self.encoder_identity, "schema": FEATURE_SCHEMA,
                  "scaler": copy.deepcopy(self.scaler), "ready": self.ready, "pretrained": self.pretrained,
-                 "deployment_mode": self.deployment_mode, "pretraining_mode": self.pretraining_mode,
+                  "deployment_mode": self.deployment_mode, "pretraining_mode": self.pretraining_mode,
+                  "training_protocol": self.training_protocol, "warm_started": self.warm_started,
                  "deployment_stage": self._deployment_stage(),
                  "version": self.version, "step": self.step, "bad_windows": self.bad_windows,
                  "role_bad_windows": self.role_bad_windows, "temporal_bad_windows": self.temporal_bad_windows,
@@ -896,18 +1236,193 @@ class PrefixValueScorer:
         torch.save(_cpu_copy(state), temporary)
         os.replace(temporary, target)
 
-    def load(self, path, *, resume=False):
+    def _migrate_semantic_cache(self, state):
+        """Read only raw action metadata from the known legacy cache schema."""
+        rows, missing, invalid = [], 0, 0
+        migrated = zero_tokens = invalid_actions = 0
+        seen = set()
+        raw = state.get("replay_feature_storage", "raw") == "raw" and state.get("schema") == FEATURE_SCHEMA
+        for uid, source in state.get("replay", []):
+            row = dict(source)
+            features = row.get("features")
+            roles, terminal = row.get("prefix_roles", []), row.get("prefix_terminal")
+            if (not torch.is_tensor(features) or features.ndim != 2 or features.shape[1] != self.feature_dim
+                    or not len(features) or not bool(torch.isfinite(features).all())
+                    or not torch.is_tensor(terminal) or terminal.dtype != torch.bool or terminal.shape != (len(features),)
+                    or len(roles) != len(features) or roles[0] != "initial"
+                    or any(r not in ("solver", "verifier") for r in roles[1:])
+                    or row.get("label") not in (0.0, 1.0) or not row.get("question_key")
+                    or str(row.get("traj_uid", uid)) != str(uid) or str(uid) in seen):
+                invalid += 1
+                continue
+            seen.add(str(uid))
+            row["traj_uid"] = str(uid)
+            own = row.get("semantic_available")
+            explicit = (row.get("semantic_metadata_schema") == _SEMANTIC_METADATA_SCHEMA
+                        and torch.is_tensor(own) and own.dtype == torch.bool and own.shape == (len(features),))
+            if not explicit:
+                own = torch.zeros(len(features), dtype=torch.bool)
+                absolute = row.get("absolute")
+                if raw and torch.is_tensor(absolute) and absolute.shape == (len(features), len(ABS_FEATURE_NAMES)):
+                    own[0] = True
+                    for i, role in enumerate(roles[1:], 1):
+                        offset = 0 if role == "solver" else 6
+                        # Do not inspect mean, coverage or entropy availability.
+                        log_tokens, valid, truncated = absolute[i, offset + 2:offset + 5].tolist()
+                        if (math.isfinite(log_tokens) and log_tokens >= 0 and valid in (0.0, 1.0)
+                                and truncated in (0.0, 1.0)):
+                            own[i] = log_tokens > 0 and valid == 1.0 and truncated == 0.0
+                            migrated += 1
+                            zero_tokens += int(log_tokens == 0)
+                            invalid_actions += int(valid == 0.0 or truncated == 1.0)
+                        else:
+                            missing += 1
+                else:
+                    missing += max(0, len(features) - 1)
+                row["semantic_available"] = own
+                row["semantic_metadata_schema"] = _SEMANTIC_METADATA_SCHEMA
+            rows.append(row)
+        return rows, {"cache_trajectories": len(rows), "cache_invalid_trajectories": invalid,
+                      "cache_metadata_unrecoverable_prefixes": missing,
+                      "cache_raw_metadata_migrated_prefixes": migrated,
+                      "cache_zero_or_missing_response_tokens_prefixes": zero_tokens,
+                      "cache_invalid_or_truncated_prefixes": invalid_actions}
+
+    def _semantic_load_result(self):
+        return {"ready": self.ready, "semantic_ready": self.ready, "version": self.version,
+                "pretrained": self.pretrained, "warm_started": self.warm_started,
+                "prediction_mode": self.prediction_mode, "deployment_stage": self._deployment_stage(),
+                "pretraining_mode": self.pretraining_mode,
+                "reliability": self.reliability.copy(), "temporal_reliability": self.temporal_reliability.copy(),
+                "semantic_reliability": self.semantic_reliability.copy(),
+                "metrics": copy.deepcopy(self.last_metrics),
+                "startup_semantic_report": copy.deepcopy(self.startup_semantic_report)}
+
+    def _load_semantic(self, state, *, resume, warm_start):
+        if state["config"]["head_hidden_dim"] != self.config["head_hidden_dim"]:
+            raise ValueError("checkpoint semantic head_hidden_dim does not match")
+        if resume:
+            for key in _DEFAULTS.keys() - {"device", "cpu_num_threads", "allow_absolute_only_pretrain"}:
+                if state["config"].get(key, _DEFAULTS[key]) != self.config[key]:
+                    raise ValueError(f"resume configuration mismatch: {key}")
+        if warm_start:
+            # Import only the trained candidate semantic branch. In particular,
+            # a failed offline deployed_head may be entirely untrained.
+            weights = {key.removeprefix("semantic."): value for key, value in state["candidate_head"].items()
+                       if key.startswith("semantic.")}
+            self.candidate_head.semantic.load_state_dict(weights, strict=True)
+            self._configure_semantic_training()
+            self.scaler = None
+            self.ready = self.pretrained = False
+            self.warm_started = True
+            self.version = self.step = self.bad_windows = 0
+            self.reliability = {"solver": 0.0, "verifier": 0.0}
+            self.temporal_reliability = {"solver": 0.0, "verifier": 0.0}
+            self.semantic_reliability = {"solver": 0.0, "verifier": 0.0}
+            self.role_bad_windows = {"solver": 0, "verifier": 0}
+            self.temporal_bad_windows = {"solver": 0, "verifier": 0}
+            self.semantic_validation_fingerprints = {"solver": None, "verifier": None}
+            self.last_validation_fingerprint = None
+            self._pending, self._replay = OrderedDict(), OrderedDict()
+            self._rng = torch.Generator(device="cpu").manual_seed(int(self.config["seed"]))
+            self.pretraining_mode = state.get("pretraining_mode", "full")
+            rows, report = self._migrate_semantic_cache(state)
+            source_salt = state["config"].get("holdout_salt", _DEFAULTS["holdout_salt"])
+            source_fraction = float(state["config"].get("validation_fraction", _DEFAULTS["validation_fraction"]))
+            if not 0 < source_fraction < 1:
+                raise ValueError("source checkpoint validation_fraction is invalid")
+            train, val = [], []
+            for row in rows:
+                digest = hashlib.sha256((str(source_salt) + "\0" + str(row["question_key"])).encode()).digest()
+                (val if int.from_bytes(digest[:8], "big") / (1 << 64) < source_fraction else train).append(row)
+            report.update(train_trajectories=len(train), val_trajectories=len(val),
+                          deployed=0, disabled=0, qualification_source="source_checkpoint_replay",
+                          source_holdout_salt=str(source_salt), source_validation_fraction=source_fraction)
+            # No optimizer step and no encoder call on any source trajectory.
+            self._validate_semantic_deploy(train, val, report)
+            report.update(ready=float(self.ready), version=self.version)
+            self.startup_semantic_report = copy.deepcopy(report)
+            self.last_metrics = copy.deepcopy(report)
+            # Local references to the historical replay die on return. Only new
+            # representative rollouts will populate the online run's cache.
+            return self._semantic_load_result()
+
+        if state.get("training_protocol") != _SEMANTIC_TRAINING_PROTOCOL or state.get("deployment_mode") != "semantic_only":
+            raise ValueError("checkpoint lacks the semantic training/deployment protocol")
+        if state.get("deployment_stage") != "semantic_only":
+            raise ValueError("checkpoint semantic deployment stage mismatch")
+        permissions = state.get("semantic_reliability", {})
+        if set(permissions) != {"solver", "verifier"} or any(
+                not math.isfinite(float(v)) or float(v) not in (0.0, 1.0) for v in permissions.values()):
+            raise ValueError("checkpoint semantic role permissions are invalid")
+        if bool(state["ready"]) != any(permissions.values()) or (state["ready"] and int(state["version"]) < 1):
+            raise ValueError("checkpoint ready/version disagree with semantic permissions")
+        if any(state.get(name, {}).get(role, 0.0) != 0 for name in ("reliability", "temporal_reliability")
+               for role in permissions):
+            raise ValueError("semantic checkpoint cannot claim entropy permissions")
+        if not resume and not state.get("ready"):
+            raise ValueError("initialization requires a semantic-qualified checkpoint, or explicit candidate mode")
+        self._configure_semantic_training()
+        for name in ("candidate_head", "deployed_head", "control_head", "temporal_control_head"):
+            getattr(self, name).load_state_dict(state[name])
+        if not resume:
+            self.candidate_head.semantic.load_state_dict(self.deployed_head.semantic.state_dict())
+        self.scaler = None
+        self.ready, self.version = bool(state["ready"]), int(state["version"])
+        self.pretrained = False  # semantic qualification is never entropy pretraining qualification
+        self.warm_started = bool(state.get("warm_started", False))
+        self.pretraining_mode = state.get("pretraining_mode", "full")
+        self.semantic_reliability = dict(permissions)
+        self.reliability = {r: 0.0 for r in permissions}
+        self.temporal_reliability = {r: 0.0 for r in permissions}
+        self.startup_semantic_report = copy.deepcopy(state.get("startup_semantic_report", {}))
+        self.last_metrics = copy.deepcopy(state["last_metrics"])
+        if resume:
+            for name in ("optimizer", "control_optimizer", "temporal_control_optimizer"):
+                optimizer = getattr(self, name)
+                optimizer.load_state_dict(state[name])
+                for value in optimizer.state.values():
+                    for key, item in value.items():
+                        if torch.is_tensor(item):
+                            value[key] = item.to(self.device)
+            self._replay, self._pending = OrderedDict(state["replay"]), OrderedDict(state["pending"])
+            self._rng.set_state(state["rng_state"])
+            self.step, self.bad_windows = int(state["step"]), int(state["bad_windows"])
+            self.role_bad_windows = dict(state["role_bad_windows"])
+            self.temporal_bad_windows = dict(state["temporal_bad_windows"])
+            self.semantic_validation_fingerprints = dict(state["semantic_validation_fingerprints"])
+            self.last_validation_fingerprint = state.get("last_validation_fingerprint")
+        return self._semantic_load_result()
+
+    def load(self, path, *, resume=False, warm_start=False):
         """Load a trusted local checkpoint; initialization keeps runtime policy.
 
         Old sup single-head checkpoints are intentionally incompatible. Fresh
         main training loads validated weights/scaler, without offline replay or
-        optimizer momentum. Exact run resume restores their state.
+        optimizer momentum. Exact run resume restores their state. Explicit
+        warm-start imports a candidate as a new, unqualified online learner;
+        it never presents that candidate as a validated deployed predictor.
         """
+        if not isinstance(resume, bool) or not isinstance(warm_start, bool):
+            raise ValueError("resume and warm_start must be boolean")
+        if resume and warm_start:
+            raise ValueError("warm_start initializes a new run and cannot be combined with resume")
         state = torch.load(Path(path), map_location="cpu", weights_only=False)
         if state.get("checkpoint_version") != _CHECKPOINT_VERSION or state.get("schema") != FEATURE_SCHEMA:
             raise ValueError("checkpoint is not an entropy-aware v2 prefix-value checkpoint")
         if state.get("encoder_identity") != self.encoder_identity:
             raise ValueError("checkpoint fixed encoder identity/serialization does not match")
+        source_mode = state.get("prediction_mode", "entropy_aware")
+        if source_mode not in ("entropy_aware", "semantic_only"):
+            raise ValueError("checkpoint prediction_mode is invalid")
+        if state["config"].get("prediction_mode", "entropy_aware") != source_mode:
+            raise ValueError("checkpoint prediction_mode disagrees with configuration")
+        if source_mode != self.prediction_mode and not warm_start:
+            raise ValueError("prediction_mode mismatch: cross-mode resume/qualified load is forbidden; initialize a new candidate run")
+        if self.prediction_mode == "semantic_only":
+            return self._load_semantic(state, resume=resume, warm_start=warm_start)
+        if source_mode == "semantic_only":
+            raise ValueError("semantic-only weights have no entropy qualification; use an entropy-aware checkpoint")
         for key in ("head_hidden_dim", "entropy_hidden_dim", "holdout_salt", "validation_fraction", "min_entropy_coverage"):
             if state["config"][key] != self.config[key]:
                 raise ValueError(f"checkpoint {key} does not match runtime configuration")
@@ -922,6 +1437,11 @@ class PrefixValueScorer:
                     raise ValueError(f"resume configuration mismatch: {key}")
         deployment_mode = state.get("deployment_mode", "full")
         pretraining_mode = state.get("pretraining_mode", "full")
+        training_protocol = state.get("training_protocol", "legacy")
+        if training_protocol not in ("legacy", _PAIRED_TRAINING_PROTOCOL):
+            raise ValueError("checkpoint contains an unsupported value training protocol")
+        if not isinstance(state.get("warm_started", False), bool):
+            raise ValueError("checkpoint warm_started must be boolean")
         if deployment_mode not in ("full", "absolute_bootstrap") or pretraining_mode not in ("full", "absolute"):
             raise ValueError("checkpoint contains an invalid value deployment mode")
         if ((state["config"].get("allow_absolute_only_pretrain", False) or pretraining_mode == "absolute")
@@ -951,9 +1471,42 @@ class PrefixValueScorer:
                 raise ValueError("checkpoint scaler feature order/dimension mismatch")
             if not all(math.isfinite(float(x)) for x in spec["center"] + spec["scale"]) or min(spec["scale"]) <= 0:
                 raise ValueError("checkpoint scaler contains invalid values")
-        if not resume and (not state.get("ready") or not state.get("pretrained")):
+        if not resume and not warm_start and (not state.get("ready") or not state.get("pretrained")):
             raise ValueError("initialization requires an entropy-qualified pretrained checkpoint")
         self.scaler = copy.deepcopy(scaler)
+        if warm_start:
+            # A version-zero failed offline checkpoint has a trained candidate
+            # but an untrained deployed head. Never initialize from the latter.
+            self.candidate_head.load_state_dict(state["candidate_head"])
+            self.control_head.load_state_dict(state["candidate_head"])
+            self.temporal_control_head.load_state_dict(state["candidate_head"])
+            self.candidate_head.eval().requires_grad_(True)
+            self.control_head.eval().requires_grad_(True)
+            self.temporal_control_head.eval().requires_grad_(True)
+            self.deployed_head.eval().requires_grad_(False)
+            self.encoder.eval().requires_grad_(False)
+            self.training_protocol = _PAIRED_TRAINING_PROTOCOL
+            self.warm_started = True
+            self.deployment_mode = "absolute_bootstrap"
+            self.pretraining_mode = pretraining_mode
+            self.ready = self.pretrained = False
+            self.version = self.step = self.bad_windows = 0
+            self.reliability = {"solver": 0.0, "verifier": 0.0}
+            self.temporal_reliability = {"solver": 0.0, "verifier": 0.0}
+            self.role_bad_windows = {"solver": 0, "verifier": 0}
+            self.temporal_bad_windows = {"solver": 0, "verifier": 0}
+            self.last_validation_fingerprint = None
+            self._absolute_pretrain_active = False
+            self._pending, self._replay = OrderedDict(), OrderedDict()
+            self._rng = torch.Generator(device="cpu").manual_seed(int(self.config["seed"]))
+            for name, head in (("optimizer", self.candidate_head), ("control_optimizer", self.control_head),
+                               ("temporal_control_optimizer", self.temporal_control_head)):
+                setattr(self, name, torch.optim.AdamW(head.parameters(), lr=float(self.config["learning_rate"]),
+                                                     weight_decay=float(self.config["weight_decay"])))
+            self.last_metrics = {**self._deployment_metrics(), "ready": 0.0, "version": 0}
+            return {"ready": False, "pretrained": False, "version": 0, "warm_started": True,
+                    "reliability": self.reliability.copy(), "temporal_reliability": self.temporal_reliability.copy(),
+                    "deployment_stage": self._deployment_stage(), "pretraining_mode": self.pretraining_mode}
         self.deployed_head.load_state_dict(state["deployed_head"])
         self.candidate_head.load_state_dict(state["candidate_head"] if resume else state["deployed_head"])
         self.control_head.load_state_dict(state["control_head"])
@@ -965,6 +1518,7 @@ class PrefixValueScorer:
         self.encoder.eval().requires_grad_(False)
         self.ready, self.pretrained = bool(state["ready"]), bool(state.get("pretrained"))
         self.deployment_mode, self.pretraining_mode = deployment_mode, pretraining_mode
+        self.training_protocol, self.warm_started = training_protocol, state.get("warm_started", False)
         self.version = int(state["version"])
         self.reliability = dict(state["reliability"])
         self.temporal_reliability = dict(state["temporal_reliability"])
@@ -983,7 +1537,8 @@ class PrefixValueScorer:
             self.role_bad_windows = dict(state.get("role_bad_windows", {"solver": 0, "verifier": 0}))
             self.temporal_bad_windows = dict(state.get("temporal_bad_windows", {"solver": 0, "verifier": 0}))
             self.last_validation_fingerprint = state.get("last_validation_fingerprint")
-        return {"ready": self.ready, "version": self.version, "reliability": self.reliability.copy(),
+        return {"ready": self.ready, "version": self.version, "warm_started": self.warm_started,
+                "reliability": self.reliability.copy(),
                 "temporal_reliability": self.temporal_reliability.copy(),
                 "deployment_stage": self._deployment_stage(), "pretraining_mode": self.pretraining_mode}
 

@@ -132,3 +132,8 @@ data/
 .tmp
 *ports
 
+
+# Local test caches
+.pytest_cache/
+pytest-cache-files-*/
+.ruff_cache/

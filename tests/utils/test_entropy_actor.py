@@ -116,7 +116,8 @@ def test_dense_forward_uses_full_vocabulary_entropy_and_safe_shared_backward():
     assert logits.grad.abs().sum() > 0
 
 
-def run_update(enabled, *, gate=1., advantage=0., micro_size=1, valid=(True, True)):
+def run_update(enabled, *, gate=1., advantage=0., micro_size=1, valid=(True, True),
+               prediction_mode="entropy_aware", cap=0.):
     logits = torch.nn.Parameter(torch.tensor([2., 0., -1.]))
     model = torch.nn.ParameterList([logits])
     optimizer = torch.optim.SGD(model.parameters(), lr=.1)
@@ -154,12 +155,14 @@ def run_update(enabled, *, gate=1., advantage=0., micro_size=1, valid=(True, Tru
                    ("responses", "input_ids", "attention_mask", "position_ids", "old_log_probs")})
     batch["advantages"] = torch.full((2, 2), advantage)
     if enabled:
-        batch.update(entropy_control_weight=torch.full((2,), gate),
-                     entropy_control_cap=torch.zeros(2),
+        gates = gate.expand(2) if torch.is_tensor(gate) else torch.full((2,), gate)
+        batch.update(entropy_control_weight=gates,
+                     entropy_control_cap=torch.full((2,), cap),
                      entropy_control_valid=torch.tensor(valid))
     initial = logits.detach().clone()
     result = actor_method("update_policy", compute_policy_loss=policy_loss)(
-        actor, Proto(batch, {"temperature": 1.}, {"wg_id": ["solver", "solver"]}))
+        actor, Proto(batch, {"temperature": 1., "entropy_control_prediction_mode": prediction_mode,
+                            "entropy_control_semantic_strength": .25}, {"wg_id": ["solver", "solver"]}))
     return initial, logits.detach().clone(), result, forward_requests, ppo_advantages
 
 
@@ -191,3 +194,45 @@ def test_actor_entropy_term_is_invariant_to_microbatch_partition_with_invalid_pa
     _, small, _, _, _ = run_update(True, micro_size=1, valid=(True, False))
     _, large, _, _, _ = run_update(True, micro_size=2, valid=(True, False))
     torch.testing.assert_close(small, large, rtol=0, atol=0)
+
+
+def test_semantic_controller_to_actual_actor_loss_updates_actor_without_value_gradient():
+    import numpy as np
+
+    controller = _CONTROL.EntropyController(dict(
+        enabled=True, prediction_mode="semantic_only", min_calibration_actions=2,
+        cap_margin=.05, ramp_steps=1))
+    meta = {
+        "traj_uid": np.asarray(["t0", "t1"], dtype=object),
+        "agent_id": np.asarray(["Solver Agent"] * 2, dtype=object),
+        "role_turn_index": np.zeros(2, dtype=int), "is_action_valid": np.ones(2, bool),
+        "pure_entropy_response_tokens": np.full(2, 2),
+        "control_delta": np.full(2, -.2), "control_available": np.ones(2, bool),
+        "value_semantic_available": np.ones(2, bool),
+    }
+    controller.prepare(meta, np.full(2, .1), step=1, ready=False)
+    fields, _ = controller.prepare(meta, np.full(2, .5), step=2, ready=True,
+                                   reliability={"solver": 1.})
+    # An intentionally differentiable gate verifies the Actor's final defensive
+    # detach as well as the usual NumPy/Ray boundary between value and Actor.
+    value_parameter = torch.nn.Parameter(torch.tensor(float(fields["entropy_control_weight"][0])))
+    initial, final, metrics, _, advantages = run_update(
+        True, gate=value_parameter, cap=float(fields["entropy_control_cap"][0]),
+        prediction_mode="semantic_only")
+    assert not torch.equal(initial, final)
+    assert value_parameter.grad is None
+    assert all(not a.any() for a in advantages)
+    hinge = metrics["actor/solver/entropy_control/hinge_loss"]
+    assert hinge == metrics["actor/solver/entropy_control/semantic_hinge_loss"]
+    assert all(v > 0 for v in hinge)
+    assert metrics["actor/solver/entropy_control/loss_coef"] == [.1]
+    assert metrics["actor/solver/entropy_control/semantic_strength"] == [.25]
+    _, legacy, _, _, _ = run_update(True, gate=float(value_parameter.detach()),
+                                    cap=float(fields["entropy_control_cap"][0]))
+    torch.testing.assert_close(final, legacy, rtol=0, atol=0)  # no double loss addition
+
+
+def test_semantic_actor_below_cap_produces_zero_loss_even_with_nonzero_gate():
+    initial, final, metrics, _, _ = run_update(True, prediction_mode="semantic_only", cap=2.)
+    torch.testing.assert_close(initial, final, rtol=0, atol=0)
+    assert not any(metrics["actor/solver/entropy_control/semantic_hinge_loss"])

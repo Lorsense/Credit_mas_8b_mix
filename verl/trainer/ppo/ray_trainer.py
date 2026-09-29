@@ -147,6 +147,38 @@ class ResourcePoolManager:
         validate_pool_layout(ray.state.available_resources_per_node(), self.resource_pool_spec, cpus_per_gpu=1)
 
 
+def validate_value_control_modes(value, control):
+    """Reject incompatible prediction routes before allocating any workers."""
+    modes = ("entropy_aware", "semantic_only")
+    value_mode = value.get("prediction_mode", "entropy_aware")
+    control_mode = control.get("prediction_mode", "entropy_aware")
+    if value_mode not in modes or control_mode not in modes:
+        raise ValueError("value/control prediction_mode must be entropy_aware or semantic_only")
+    if value_mode != control_mode:
+        raise ValueError("value and control prediction_mode must agree")
+    try:
+        strength = float(control.get("semantic_strength", 0.25))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("control.semantic_strength must be finite and in [0, 1]") from exc
+    if not np.isfinite(strength) or not 0 <= strength <= 1:
+        raise ValueError("control.semantic_strength must be finite and in [0, 1]")
+
+
+def validate_value_initialization(config, state):
+    """Candidate loading may publish only after its mode-specific qualification."""
+    mode = config.get("initialization_mode", "qualified")
+    if mode not in ("qualified", "candidate"):
+        raise ValueError("value.initialization_mode must be qualified or candidate")
+    prediction_mode = config.get("prediction_mode", "entropy_aware")
+    if state.get("prediction_mode", "entropy_aware") != prediction_mode:
+        raise ValueError("Loaded value prediction_mode differs from the configured mode")
+    if mode == "candidate":
+        if not state.get("warm_started", False):
+            raise ValueError("Candidate initialization requires a successfully loaded candidate checkpoint")
+    elif config.get("require_pretrained", True) and not state.get("ready", False):
+        raise ValueError(f"Main training requires a ready {prediction_mode} prefix_value.pt; run offline pretraining first")
+
+
 def value_scorer_metrics(phase: str, raw: dict) -> dict[str, float]:
     """Log the deployed scorer separately from candidate training diagnostics."""
     metrics = {
@@ -944,8 +976,11 @@ class RayPPOTrainer:
         entropy = self.config.algorithm.get("entropy_credit", {})
         value = entropy.get("value", {})
         control = entropy.get("control", {})
+        validate_value_control_modes(value, control)
         self.value_credit_enabled = bool(value.get("enable", False))
         self.entropy_control_enabled = bool(control.get("enabled", False))
+        if value.get("initialization_mode", "qualified") not in ("qualified", "candidate"):
+            raise ValueError("value.initialization_mode must be qualified or candidate")
         if self.entropy_control_enabled and not self.value_credit_enabled:
             raise ValueError("entropy control requires entropy_credit.value.enable=True")
         for agents in self.wg_to_agents_mapping.values():
@@ -988,7 +1023,7 @@ class RayPPOTrainer:
         if initial:
             initial = os.path.abspath(os.path.expanduser(initial))
             if not os.path.isfile(initial):
-                raise FileNotFoundError(f"Missing pretrained entropy-aware value checkpoint: {initial}")
+                raise FileNotFoundError(f"Missing pretrained prefix value checkpoint: {initial}")
         use_gpu = value.get("device", "cpu") == "cuda:0"
         node_id = ray.get_runtime_context().get_node_id()
         available = ray.state.available_resources_per_node()
@@ -1005,13 +1040,16 @@ class RayPPOTrainer:
         ).remote(value)
         ray.get(self.value_scorer.prepare.remote([]), timeout=float(value.get("startup_timeout", 1800)))
         if initial:
-            loaded = ray.get(self.value_scorer.load.remote(initial, resume=False))
-            if value.get("require_pretrained", True) and not loaded.get("ready", False):
-                raise ValueError("Initial value checkpoint has not passed entropy-aware readiness checks")
+            warm_start = value.get("initialization_mode", "qualified") == "candidate"
+            loaded = ray.get(self.value_scorer.load.remote(initial, resume=False, warm_start=warm_start))
+            validate_value_initialization(value, loaded)
+            self.value_initialization_report = loaded.get("metrics", {})
+            print("Value initialization report:", self.value_initialization_report)
 
     def _prepare_value_credit(self, batch: DataProto) -> dict[str, float]:
+        prediction_mode = self.config.algorithm.entropy_credit.value.get("prediction_mode", "entropy_aware")
         records, metrics = build_trajectory_records(
-            batch.non_tensor_batch, int(self.config.agent.orchestra.math.max_loop_num)
+            batch.non_tensor_batch, int(self.config.agent.orchestra.math.max_loop_num), prediction_mode=prediction_mode
         )
         if getattr(self, "question_curriculum", None) is not None:
             sources = {}
@@ -1024,13 +1062,18 @@ class RayPPOTrainer:
                 record["train_eligible"] = sources[record["traj_uid"]] == "fresh"
         scored = ray.get(self.value_scorer.prepare.remote(records))
         self.value_scorer_ready = bool(scored["ready"])
-        self.value_scorer_reliability = scored.get("reliability", float(self.value_scorer_ready))
+        self.value_scorer_reliability = (
+            scored.get("semantic_reliability", {}) if prediction_mode == "semantic_only"
+            else scored.get("reliability", float(self.value_scorer_ready))
+        )
         self.value_scorer_temporal_reliability = scored.get("temporal_reliability", {})
         metrics.update(value_scorer_metrics("score", scored["metrics"]))
         batch.non_tensor_batch["value_credit_scorer_version"] = np.full(
             len(batch), int(scored["metrics"].get("version", 0)), dtype=np.int64
         )
-        metrics.update(attach_value_predictions(batch.non_tensor_batch, scored["values"], scored["ready"]))
+        metrics.update(attach_value_predictions(
+            batch.non_tensor_batch, scored["values"], scored["ready"], prediction_mode=prediction_mode
+        ))
         return metrics
 
     def _prepare_entropy_control(self, batch: DataProto) -> dict[str, float]:
@@ -1043,6 +1086,8 @@ class RayPPOTrainer:
             self.global_steps, self.value_scorer_ready, self.value_scorer_reliability,
             temporal_reliability=self.value_scorer_temporal_reliability,
         )
+        batch.meta_info["entropy_control_prediction_mode"] = self.entropy_controller.config.get("prediction_mode", "entropy_aware")
+        batch.meta_info["entropy_control_semantic_strength"] = self.entropy_controller.config.get("semantic_strength", 0.25)
         for key, array in arrays.items():
             dtype = torch.bool if key == "entropy_control_valid" else torch.float32
             batch.batch[key] = torch.as_tensor(array, dtype=dtype,
@@ -1787,12 +1832,15 @@ class RayPPOTrainer:
 
         if self.value_scorer is not None:
             initial = ray.get(self.value_scorer.prepare.remote([]))
-            # A resumed deployed model may have been temporarily disabled by
-            # online validation. Preserve that state and let it recover; only
-            # a fresh run requires an already qualified initialization.
-            if self.global_steps == 0 and self.config.algorithm.entropy_credit.value.get("require_pretrained", True) and not initial["ready"]:
-                raise ValueError("Main training requires a ready entropy-aware prefix_value.pt; run offline pretraining first")
-            logger.log(data={"value_model/ready_at_training_start": float(initial["ready"])}, step=self.global_steps)
+            # Exact resume retains pending/disabled deployment. Explicit candidate
+            # startup must have actually loaded weights; a config flag is insufficient.
+            if self.global_steps == 0:
+                validate_value_initialization(self.config.algorithm.entropy_credit.value, initial)
+            startup_metrics = {"value_model/ready_at_training_start": float(initial["ready"]),
+                               "value_model/warm_started_at_training_start": float(initial.get("warm_started", False))}
+            startup_metrics.update(value_scorer_metrics("startup", getattr(self, "value_initialization_report", {})))
+            startup_metrics.update(value_scorer_metrics("startup", initial.get("metrics", {})))
+            logger.log(data=startup_metrics, step=self.global_steps)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.

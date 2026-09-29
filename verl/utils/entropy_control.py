@@ -17,6 +17,8 @@ import numpy as np
 
 DEFAULT_ENTROPY_CONTROL_CONFIG = {
     "enabled": False,
+    "prediction_mode": "entropy_aware",
+    "semantic_strength": 0.25,
     "fast_beta": 0.9,
     "slow_beta": 0.99,
     "cap_margin": 0.2,
@@ -40,6 +42,12 @@ def normalize_entropy_control_config(config=None):
     result = dict(DEFAULT_ENTROPY_CONTROL_CONFIG)
     if config is not None:
         result.update(dict(config))
+    if result["prediction_mode"] not in ("entropy_aware", "semantic_only"):
+        raise ValueError("entropy control prediction_mode must be entropy_aware or semantic_only")
+    strength = float(result["semantic_strength"])
+    if not math.isfinite(strength) or not 0 <= strength <= 1:
+        raise ValueError("entropy control semantic_strength must be finite and lie in [0, 1]")
+    result["semantic_strength"] = strength
     for key in ("fast_beta", "slow_beta"):
         if not 0 <= float(result[key]) < 1:
             raise ValueError(f"entropy control {key} must lie in [0, 1)")
@@ -92,9 +100,12 @@ class EntropyController:
     Input rows are individual actions. Repeated ``(traj_uid, agent_id, turn)``
     padding rows do not contribute to calibration, trends, or the Actor penalty.
     ``ready`` describes the deployed head used for this batch, not its candidate.
+    Each role ramps independently on qualified batches with usable predictions.
+    Losing role qualification restarts its ramp; missing usable actions pauses
+    the ramp without advancing it merely because training steps have elapsed.
     """
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, config=None):
         self.config = normalize_entropy_control_config(config)
@@ -102,6 +113,7 @@ class EntropyController:
         self.start_step = None
         self.ready_step = None
         self.last_step = None
+        self.role_ramps = {}
 
     def state_dict(self):
         return {
@@ -110,11 +122,13 @@ class EntropyController:
             "start_step": self.start_step,
             "ready_step": self.ready_step,
             "last_step": self.last_step,
+            "role_ramps": [{"role": role, **dict(value)} for role, value in sorted(self.role_ramps.items())],
             "groups": [{"role": key[0], "turn": key[1], **dict(value)} for key, value in sorted(self.groups.items())],
         }
 
     def load_state_dict(self, state):
-        if int(state.get("version", -1)) != self.VERSION:
+        version = int(state.get("version", -1))
+        if version not in (1, self.VERSION):
             raise ValueError("unsupported entropy controller checkpoint version")
         # Saved scales/caps must remain compatible on resume. Explicitly starting
         # a new controller is required to change calibration conventions.
@@ -129,6 +143,57 @@ class EntropyController:
         for row in state.get("groups", []):
             key = (str(row["role"]), int(row["turn"]))
             self.groups[key] = {k: v for k, v in row.items() if k not in ("role", "turn")}
+        # Version 1 only saved a global ready_step. It cannot establish when a
+        # particular role qualified, so retain caps/trends but restart ramps.
+        self.role_ramps = {}
+        if version == self.VERSION:
+            for row in state["role_ramps"]:
+                role = str(row["role"])
+                updates = int(row["qualified_updates"])
+                qualified = bool(row["qualified"])
+                if (role in self.role_ramps or updates != row["qualified_updates"]
+                        or not 0 <= updates <= self.config["ramp_steps"]
+                        or (updates and not qualified)):
+                    raise ValueError("invalid entropy controller role ramp checkpoint")
+                self.role_ramps[role] = {"qualified_updates": updates, "qualified": qualified}
+
+    def _prepare_role_ramps(self, roles, turns, confidence, reliability, controls, available, ready, metrics):
+        """Count usable qualified batches once per role, never once per turn."""
+        observed = defaultdict(list)
+        for row, role in enumerate(roles):
+            observed[str(role)].append(row)
+        known_scopes = set(self.groups) | {(str(role), int(turn)) for role, turn in zip(roles, turns)}
+        role_confidence = {role: bool(np.any(confidence[rows] > 0)) for role, rows in observed.items()}
+        # A role can lose qualification while absent from a batch. Mappings and
+        # scalar reliability can express this; row-wise arrays cannot, so absent
+        # roles retain their last qualification and their ramp remains paused.
+        if isinstance(reliability, Mapping) or np.asarray(reliability).ndim == 0:
+            scope_keys = sorted(known_scopes)
+            scope_confidence = _role_confidence(reliability, [key[0] for key in scope_keys], [key[1] for key in scope_keys])
+            for (role, _), value in zip(scope_keys, scope_confidence):
+                role_confidence[role] = role_confidence.get(role, False) or value > 0
+        eligible_counts = defaultdict(int)
+        for (role, _), (rows, _) in controls.items():
+            eligible_counts[role] += int(np.count_nonzero(available[rows] & (confidence[rows] > 0)))
+        ramps = {}
+        for role in sorted(set(self.role_ramps) | set(observed) | {key[0] for key in known_scopes}):
+            state = self.role_ramps.setdefault(role, {"qualified_updates": 0, "qualified": False})
+            qualified = bool(ready) and bool(role_confidence.get(role, state["qualified"]))
+            reset = not qualified and state["qualified_updates"] > 0
+            if not qualified:
+                state["qualified_updates"] = 0
+            elif eligible_counts[role]:
+                state["qualified_updates"] = min(self.config["ramp_steps"], state["qualified_updates"] + 1)
+            state["qualified"] = qualified
+            ramps[role] = state["qualified_updates"] / self.config["ramp_steps"] if qualified else 0.0
+            scope = f"entropy_control/{role}"
+            metrics[scope + "/qualified"] = float(qualified)
+            metrics[scope + "/qualified_updates"] = float(state["qualified_updates"])
+            metrics[scope + "/ramp"] = float(ramps[role])
+            metrics[scope + "/ramp_paused"] = float(qualified and not eligible_counts[role])
+            metrics[scope + "/ramp_reset"] = float(reset)
+            metrics[scope + "/eligible_actions"] = float(eligible_counts[role] if qualified else 0)
+        return ramps
 
     def prepare(self, meta, full_entropy_means, step, ready, reliability=1.0, temporal_reliability=None):
         entropies = np.asarray(full_entropy_means, dtype=np.float64)
@@ -140,7 +205,10 @@ class EntropyController:
             "entropy_control_cap": np.zeros(size, dtype=np.float32),
             "entropy_control_valid": np.zeros(size, dtype=bool),
         }
-        metrics = {"entropy_control/enabled": float(bool(self.config["enabled"]))}
+        semantic_only = self.config["prediction_mode"] == "semantic_only"
+        metrics = {"entropy_control/enabled": float(bool(self.config["enabled"])),
+                   "entropy_control/prediction_source_semantic_only": float(semantic_only),
+                   "entropy_control/semantic_strength": float(self.config["semantic_strength"])}
         if not self.config["enabled"] or size == 0:
             return output, metrics
         step = int(step)
@@ -164,14 +232,30 @@ class EntropyController:
         valid = _column(meta, "is_action_valid", size, False, bool)
         truncated = _column(meta, "pure_entropy_truncated", size, False, bool)
         tokens = _column(meta, "pure_entropy_response_tokens", size, 0, np.int64)
-        d_value = _column(meta, "value_credit_delta", size, np.nan, np.float64)
-        q_entropy = _column(meta, "value_entropy_delta", size, np.nan, np.float64)
-        credit_available = _column(meta, "value_credit_available", size, False, bool)
-        absolute_available = (_column(meta, "value_absolute_available", size, False, bool)
-                              if "value_absolute_available" in meta else credit_available)
-        entropy_available = _column(meta, "value_entropy_available", size, False, bool)
-        available = credit_available & absolute_available & np.isfinite(d_value)
-        temporal_available = available & entropy_available & np.isfinite(q_entropy)
+        if "value_prediction_source" in meta:
+            sources = _column(meta, "value_prediction_source", size, "", object)
+            if np.any(sources != cfg["prediction_mode"]):
+                raise ValueError("entropy controller prediction source does not match prediction_mode")
+        if semantic_only:
+            d_value = _column(meta, "control_delta", size, np.nan, np.float64)
+            credit_available = (_column(meta, "value_semantic_available", size, False, bool)
+                                & _column(meta, "control_available", size, False, bool))
+            # Do not inspect entropy branch fields, including padding equality:
+            # changing or dropping them cannot change a semantic-only gate.
+            absolute_available = np.zeros(size, dtype=bool)
+            entropy_available = np.zeros(size, dtype=bool)
+            q_entropy = np.zeros(size, dtype=np.float64)
+            available = credit_available & np.isfinite(d_value)
+            temporal_available = np.zeros(size, dtype=bool)
+        else:
+            d_value = _column(meta, "value_credit_delta", size, np.nan, np.float64)
+            q_entropy = _column(meta, "value_entropy_delta", size, np.nan, np.float64)
+            credit_available = _column(meta, "value_credit_available", size, False, bool)
+            absolute_available = (_column(meta, "value_absolute_available", size, False, bool)
+                                  if "value_absolute_available" in meta else credit_available)
+            entropy_available = _column(meta, "value_entropy_available", size, False, bool)
+            available = credit_available & absolute_available & np.isfinite(d_value)
+            temporal_available = available & entropy_available & np.isfinite(q_entropy)
         good = valid & ~truncated & (tokens > 0) & np.isfinite(entropies) & (entropies >= 0)
         groups = defaultdict(list)
         seen = {}
@@ -196,11 +280,15 @@ class EntropyController:
                 groups[(identity[1], identity[2])].append(row)
 
         confidence = _role_confidence(reliability, roles, turns)
-        temporal_confidence = _role_confidence(reliability if temporal_reliability is None else temporal_reliability, roles, turns)
-        ramp = min(1.0, (step - self.ready_step + 1) / cfg["ramp_steps"]) if ready and self.ready_step is not None else 0.0
+        temporal_confidence = (np.zeros(size) if semantic_only else
+                               _role_confidence(reliability if temporal_reliability is None else temporal_reliability, roles, turns))
         calibration_open = step - self.start_step < cfg["calibration_steps"]
         available_rows = 0
         temporal_rows = 0
+        controls = {}
+        calibrated_rows = np.zeros(size, dtype=bool)
+        sufficient_rows = np.zeros(size, dtype=bool)
+        risk_rows = np.zeros(size, dtype=np.float64)
         for key, rows in groups.items():
             values = entropies[rows]
             state = self.groups.setdefault(key, {"count": 0, "sum": 0.0, "sum_sq": 0.0, "cap": None, "fast": None, "slow": None})
@@ -219,32 +307,46 @@ class EntropyController:
             metrics[scope + "/calibration_actions"] = float(state["count"])
             if state["cap"] is None:
                 continue
+            calibrated_rows[rows] = True
             output["entropy_control_cap"][rows] = state["cap"]
             metrics[scope + "/cap"] = float(state["cap"])
             metrics[scope + "/full_entropy_mean"] = float(values.mean())
             if len(rows) < cfg["min_group_actions"]:
                 continue
+            sufficient_rows[rows] = True
             current = float(values.mean())
             state["fast"] = cfg["fast_beta"] * state["fast"] + (1 - cfg["fast_beta"]) * current
             state["slow"] = cfg["slow_beta"] * state["slow"] + (1 - cfg["slow_beta"]) * current
             trend = np.clip((state["fast"] - state["slow"] - cfg["trend_tolerance"]) / cfg["trend_scale"], 0, 1)
             excess = np.clip((current - state["cap"]) / cfg["risk_scale"], 0, 1)
             risk = float(max(trend, excess))
+            risk_rows[rows] = risk
+            controls[key] = (rows, risk)
+            metrics[scope + "/risk"] = risk
+            metrics[scope + "/fast"] = float(state["fast"])
+            metrics[scope + "/slow"] = float(state["slow"])
+
+        role_ramps = self._prepare_role_ramps(roles, turns, confidence, reliability, controls, available, ready, metrics)
+        for key, (rows, risk) in controls.items():
+            scope = f"entropy_control/{key[0]}/turn_{key[1]}"
+            ramp = role_ramps[key[0]]
             bad = np.clip((-d_value[rows] - cfg["delta_deadzone"]) / cfg["delta_scale"], 0, 1)
-            harm = np.clip((-q_entropy[rows] - cfg["entropy_delta_deadzone"]) / cfg["entropy_delta_scale"], 0, 1)
-            # A first same-role action has absolute entropy but no temporal
-            # edge. Its reliable negative progress can use the kappa base
-            # brake; absent/unqualified temporal information adds nothing.
-            harm = np.where(temporal_available[rows], harm * temporal_confidence[rows], 0.0)
-            gate = confidence[rows] * ramp * risk * bad * (cfg["kappa"] + (1 - cfg["kappa"]) * harm)
+            if semantic_only:
+                gate = confidence[rows] * ramp * risk * bad * cfg["semantic_strength"]
+            else:
+                harm = np.clip((-q_entropy[rows] - cfg["entropy_delta_deadzone"]) / cfg["entropy_delta_scale"], 0, 1)
+                # A first same-role action can use the absolute base brake;
+                # absent/unqualified temporal information adds nothing.
+                harm = np.where(temporal_available[rows], harm * temporal_confidence[rows], 0.0)
+                gate = confidence[rows] * ramp * risk * bad * (cfg["kappa"] + (1 - cfg["kappa"]) * harm)
             gate = np.where(available[rows] & bool(ready), gate, 0.0)
             output["entropy_control_weight"][rows] = gate.astype(np.float32)
             available_rows += int(available[rows].sum())
             temporal_rows += int(temporal_available[rows].sum())
-            metrics[scope + "/risk"] = risk
-            metrics[scope + "/fast"] = float(state["fast"])
-            metrics[scope + "/slow"] = float(state["slow"])
+            metrics[scope + "/ramp"] = float(ramp)
             metrics[scope + "/mean_weight"] = float(gate.mean())
+            metrics[scope + "/above_cap_fraction"] = float((entropies[rows] > output["entropy_control_cap"][rows]).mean())
+            metrics[scope + "/gate_above_cap_fraction"] = float(((gate > 0) & (entropies[rows] > output["entropy_control_cap"][rows])).mean())
             predicted = np.asarray(rows, dtype=np.int64)[available[rows]]
             if len(predicted):
                 metrics[scope + "/mean_value_delta"] = float(d_value[predicted].mean())
@@ -253,16 +355,34 @@ class EntropyController:
             if len(temporal_predicted):
                 metrics[scope + "/mean_entropy_delta"] = float(q_entropy[temporal_predicted].mean())
         count = max(1, int(output["entropy_control_valid"].sum()))
+        unique = output["entropy_control_valid"]
+        predicted = unique & available
+        qualified = (confidence > 0) & bool(ready)
+        negative = np.isfinite(d_value) & (d_value < -cfg["delta_deadzone"])
+        above_cap = unique & calibrated_rows & (entropies > output["entropy_control_cap"])
         weights = output["entropy_control_weight"]
         metrics.update({
             "entropy_control/ready": float(bool(ready)),
-            "entropy_control/ramp": float(ramp),
+            "entropy_control/ramp": float(np.mean(list(role_ramps.values()))) if role_ramps else 0.0,
             "entropy_control/valid_unique_actions": float(output["entropy_control_valid"].sum()),
             "entropy_control/prediction_coverage": available_rows / count,
             "entropy_control/temporal_prediction_coverage": temporal_rows / count,
             "entropy_control/active_fraction": float(np.count_nonzero(weights) / count),
             "entropy_control/mean_weight": float(weights.sum() / count),
             "entropy_control/calibrated_groups": float(sum(g["cap"] is not None for g in self.groups.values())),
+            "entropy_control/semantic_prediction_coverage": float(predicted.sum() / count) if semantic_only else 0.0,
+            "entropy_control/negative_progress_fraction": float((predicted & negative).sum() / max(1, predicted.sum())),
+            "entropy_control/above_cap_fraction": float(above_cap.sum() / count),
+            "entropy_control/gate_above_cap_fraction": float(((weights > 0) & above_cap).sum() / count),
+            # These are overlapping diagnostic conditions, not an additive
+            # partition; all use the valid unique action denominator.
+            "entropy_control/blocked_missing_prediction_fraction": float((unique & ~available).sum() / count),
+            "entropy_control/blocked_unqualified_fraction": float((unique & ~qualified).sum() / count),
+            "entropy_control/blocked_uncalibrated_fraction": float((unique & ~calibrated_rows).sum() / count),
+            "entropy_control/blocked_small_group_fraction": float((unique & calibrated_rows & ~sufficient_rows).sum() / count),
+            "entropy_control/blocked_no_risk_fraction": float((unique & sufficient_rows & (risk_rows <= 0)).sum() / count),
+            "entropy_control/blocked_no_negative_progress_fraction": float((predicted & ~negative).sum() / count),
+            "entropy_control/blocked_not_above_cap_fraction": float((unique & calibrated_rows & ~above_cap).sum() / count),
         })
         return output, metrics
 

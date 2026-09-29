@@ -22,7 +22,7 @@ import os
 import hydra
 import ray
 
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, validate_value_control_modes
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.credit_resources import agent_gpu_layout, validate_pool_layout
 
@@ -33,6 +33,8 @@ def main(config):
 
 
 def run_ppo(config) -> None:
+    entropy_credit = config.algorithm.get("entropy_credit", {})
+    validate_value_control_modes(entropy_credit.get("value", {}), entropy_credit.get("control", {}))
     if not ray.is_initialized():
         # this is for local ray cluster
         ray_address = config.ray_init.get("address") or os.environ.get("RAY_ADDRESS")

@@ -31,7 +31,8 @@ class Config(dict):
 
 def methods():
     source = ast.parse((ROOT / "verl/trainer/ppo/ray_trainer.py").read_text(encoding="utf-8"))
-    selected = [n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "value_scorer_metrics"]
+    selected = [n for n in source.body if isinstance(n, ast.FunctionDef)
+                and n.name in {"value_scorer_metrics", "validate_value_initialization"}]
     trainer = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "RayPPOTrainer")
     names = {"_prepare_value_credit", "_prepare_entropy_control", "_save_checkpoint", "_load_checkpoint"}
     selected += [n for n in trainer.body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -166,9 +167,94 @@ def test_startup_requires_ready_initialization_but_resumes_temporarily_disabled_
                               value_scorer=SimpleNamespace(prepare=SimpleNamespace(remote=lambda rows: {"ready": False})))
     tree = ast.fix_missing_locations(ast.Module(body=[block], type_ignores=[]))
     namespace = {"self": trainer, "ray": SimpleNamespace(get=lambda value: value),
+                 "validate_value_initialization": METHODS["validate_value_initialization"],
+                 "value_scorer_metrics": METHODS["value_scorer_metrics"],
                  "logger": SimpleNamespace(log=lambda **kwargs: None)}
     if raises:
         with pytest.raises(ValueError, match="offline pretraining"):
             exec(compile(tree, "actual_startup_gate", "exec"), namespace)
     else:
         exec(compile(tree, "actual_startup_gate", "exec"), namespace)
+
+
+@pytest.mark.parametrize("warm_started", [False, True])
+def test_candidate_startup_requires_loaded_weights_without_deployment(warm_started):
+    state = {"ready": False, "warm_started": warm_started}
+    value = {"initialization_mode": "candidate", "require_pretrained": True}
+    if warm_started:
+        METHODS["validate_value_initialization"](value, state)
+        assert not state["ready"]
+    else:
+        with pytest.raises(ValueError, match="successfully loaded candidate"):
+            METHODS["validate_value_initialization"](value, state)
+
+
+def test_qualified_startup_does_not_accept_candidate_provenance_as_qualification():
+    with pytest.raises(ValueError, match="offline pretraining"):
+        METHODS["validate_value_initialization"](
+            {"initialization_mode": "qualified"}, {"ready": False, "warm_started": True})
+
+
+def test_unknown_value_initialization_mode_fails():
+    with pytest.raises(ValueError, match="initialization_mode"):
+        METHODS["validate_value_initialization"]({"initialization_mode": "bypass"}, {"ready": True})
+
+
+def test_semantic_startup_requires_matching_mode_and_accepts_independent_qualification():
+    cfg = {"initialization_mode": "candidate", "prediction_mode": "semantic_only"}
+    with pytest.raises(ValueError, match="prediction_mode"):
+        METHODS["validate_value_initialization"](cfg, {"ready": True, "warm_started": True})
+    for ready in (False, True):
+        METHODS["validate_value_initialization"](
+            cfg, {"prediction_mode": "semantic_only", "ready": ready, "warm_started": True})
+
+
+def test_evaluation_does_not_construct_a_value_worker():
+    source = ast.parse((ROOT / "verl/trainer/ppo/ray_trainer.py").read_text(encoding="utf-8"))
+    trainer_cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "RayPPOTrainer")
+    method = next(n for n in trainer_cls.body if isinstance(n, ast.FunctionDef) and n.name == "_init_value_scorer")
+    namespace = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "actual_eval_value_skip", "exec"), namespace)
+    trainer = SimpleNamespace(value_credit_enabled=True, value_scorer=None,
+                              config=SimpleNamespace(trainer={"val_only": True}))
+    # No Ray or model imports are available here; evaluation must return first.
+    namespace[method.name](trainer)
+    assert trainer.value_scorer is None
+
+
+def test_semantic_trainer_routes_role_permissions_without_entropy_reliability():
+    batch = prepared_batch()
+    pure_factor = batch.non_tensor_batch["entropy_credit_final_multiplier"].copy()
+    advantages = batch.batch["advantages"].clone()
+    cfg = config()
+    cfg.algorithm.entropy_credit.value["prediction_mode"] = "semantic_only"
+    def semantic_prediction(records):
+        scored = prediction(records)
+        scored["reliability"] = {"solver": 0, "verifier": 0}
+        scored["semantic_reliability"] = {"solver": 1, "verifier": 0}
+        for values in scored["values"].values():
+            for i, item in enumerate(values):
+                item.update(sem=.8 - .2 * i, semantic_available=True,
+                            action_semantic_available=i > 0 and i < len(values) - 1,
+                            action_absolute_available=False, action_temporal_available=False)
+                item.pop("abs")
+                item.pop("full")
+        return scored
+    controller = CONTROL.EntropyController(dict(enabled=True, prediction_mode="semantic_only",
+                                                semantic_strength=.25, min_calibration_actions=2, ramp_steps=1))
+    trainer = SimpleNamespace(config=cfg, global_steps=1, entropy_controller=controller,
+                              value_scorer=SimpleNamespace(prepare=SimpleNamespace(remote=semantic_prediction)))
+    METHODS["_prepare_value_credit"](trainer, batch)
+    assert trainer.value_scorer_reliability == {"solver": 1, "verifier": 0}
+    METHODS["_prepare_entropy_control"](trainer, batch)
+    trainer.global_steps = 2
+    batch.non_tensor_batch["action_full_entropy"][:] = 4.0
+    METHODS["_prepare_value_credit"](trainer, batch)
+    METHODS["_prepare_entropy_control"](trainer, batch)
+    solver = batch.non_tensor_batch["agent_id"] == "Solver Agent"
+    assert batch.batch["entropy_control_weight"][solver].max() > 0
+    assert not batch.batch["entropy_control_weight"][~solver].any()
+    assert batch.meta_info["entropy_control_prediction_mode"] == "semantic_only"
+    assert batch.meta_info["entropy_control_semantic_strength"] == .25
+    np.testing.assert_array_equal(batch.non_tensor_batch["entropy_credit_final_multiplier"], pure_factor)
+    torch.testing.assert_close(batch.batch["advantages"], advantages, rtol=0, atol=0)

@@ -1,5 +1,7 @@
 # 仅用 baseline 历史轨迹初始化价值网络
 
+如果已经生成 `prefix_value.pt` 但报告为 `candidate_rejected`，可保留该文件并使用[候选初始化与在线资格流程](candidate_value_training.md)，不必为开始主训练而重新编码历史轨迹。默认 `qualified` 模式仍需先通过离线资格。
+
 已确认的数据设置是 **724 个 global step × 32 道题 × 8 条轨迹 = 185,344 条完整轨迹**。每个 step 保存一个包含 `trajectories` 数组的 JSON 文件。历史 Solver 最多 2 轮，后续主训练最多 3 轮。
 
 ## 先分清哪些信息可以学习

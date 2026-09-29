@@ -41,6 +41,18 @@ def calibrated(**kwargs):
     return obj
 
 
+def both_roles_metadata():
+    solver, verifier = metadata(), metadata()
+    verifier["agent_id"][:] = "Verifier Agent"
+    return {key: np.concatenate([solver[key], verifier[key]]) for key in solver}
+
+
+def calibrated_both_roles(**kwargs):
+    obj = controller(**kwargs)
+    obj.prepare(both_roles_metadata(), np.full(16, 1.0), step=1, ready=False)
+    return obj
+
+
 def test_disabled_controller_has_no_state_or_control_effect():
     obj = EntropyController()
     fields, metrics = obj.prepare({}, [3.0, 4.0], step=1, ready=True)
@@ -192,6 +204,82 @@ def test_reenabling_after_deployed_failure_restarts_gradual_ramp():
     np.testing.assert_allclose(fields["entropy_control_weight"], .1)
 
 
+def test_late_qualifying_role_starts_its_own_ramp_after_other_role_reaches_full_strength():
+    obj = calibrated_both_roles(ramp_steps=4)
+    for step in range(2, 6):
+        fields, _ = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=step, ready=True,
+                                reliability={"solver": 1., "verifier": 0.})
+        np.testing.assert_allclose(fields["entropy_control_weight"][:8], (step - 1) / 4)
+        assert not fields["entropy_control_weight"][8:].any()
+    fields, metrics = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=6, ready=True,
+                                  reliability={"solver": 1., "verifier": 1.})
+    np.testing.assert_allclose(fields["entropy_control_weight"][:8], 1.)
+    np.testing.assert_allclose(fields["entropy_control_weight"][8:], .25)
+    assert metrics["entropy_control/Solver Agent/qualified_updates"] == 4
+    assert metrics["entropy_control/Verifier Agent/qualified_updates"] == 1
+    assert metrics["entropy_control/Verifier Agent/ramp"] == .25
+
+
+def test_losing_role_qualification_restarts_only_that_role_even_while_head_remains_ready():
+    obj = calibrated_both_roles(ramp_steps=4)
+    for step in (2, 3):
+        obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=step, ready=True)
+    fields, metrics = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=4, ready=True,
+                                  reliability={"solver": 0., "verifier": 1.})
+    assert not fields["entropy_control_weight"][:8].any()
+    np.testing.assert_allclose(fields["entropy_control_weight"][8:], .75)
+    assert metrics["entropy_control/Solver Agent/ramp_reset"] == 1
+    assert metrics["entropy_control/Verifier Agent/ramp_reset"] == 0
+    fields, _ = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=9, ready=True)
+    np.testing.assert_allclose(fields["entropy_control_weight"][:8], .25)
+    np.testing.assert_allclose(fields["entropy_control_weight"][8:], 1.)
+
+
+@pytest.mark.parametrize("missing", ["role", "predictions", "enough_actions"])
+def test_role_ramp_pauses_without_usable_actions_instead_of_advancing_by_training_step(missing):
+    obj = calibrated_both_roles(ramp_steps=4)
+    obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=2, ready=True)
+    meta = both_roles_metadata()
+    if missing == "role":
+        meta = {key: value[:8] for key, value in meta.items()}
+    elif missing == "predictions":
+        meta["value_credit_available"][8:] = False
+    else:
+        meta = {key: value[:9] for key, value in meta.items()}
+    _, metrics = obj.prepare(meta, np.full(len(meta["agent_id"]), 2.0), step=20, ready=True)
+    assert metrics["entropy_control/Verifier Agent/ramp_paused"] == 1
+    assert metrics["entropy_control/Verifier Agent/qualified_updates"] == 1
+    fields, _ = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=30, ready=True)
+    np.testing.assert_allclose(fields["entropy_control_weight"][:8], .75)
+    np.testing.assert_allclose(fields["entropy_control_weight"][8:], .5)
+
+
+def test_absent_role_losing_qualification_resets_its_saved_ramp():
+    obj = calibrated_both_roles(ramp_steps=4)
+    obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=2, ready=True)
+    _, metrics = obj.prepare(metadata(), np.full(8, 2.0), step=3, ready=True,
+                             reliability={"solver": 1., "verifier": 0.})
+    assert metrics["entropy_control/Verifier Agent/qualified"] == 0
+    assert metrics["entropy_control/Verifier Agent/ramp_reset"] == 1
+    fields, _ = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=4, ready=True)
+    np.testing.assert_allclose(fields["entropy_control_weight"][:8], .75)
+    np.testing.assert_allclose(fields["entropy_control_weight"][8:], .25)
+
+
+def test_role_ramp_advances_once_per_batch_across_multiple_turns_and_padding():
+    obj = controller(ramp_steps=4)
+    meta = both_roles_metadata()
+    meta["agent_id"][:] = "Solver Agent"
+    meta["role_turn_index"][8:] = 2
+    meta = {key: np.concatenate([value, value]) for key, value in meta.items()}
+    obj.prepare(meta, np.full(32, 1.0), step=1, ready=False)
+    fields, metrics = obj.prepare(meta, np.full(32, 2.0), step=2, ready=True)
+    np.testing.assert_allclose(fields["entropy_control_weight"][:16], .25)
+    assert not fields["entropy_control_weight"][16:].any()
+    assert metrics["entropy_control/Solver Agent/qualified_updates"] == 1
+    assert metrics["entropy_control/Solver Agent/eligible_actions"] == 16
+
+
 def test_canonical_scorer_role_reliability_matches_rollout_agent_name():
     obj = calibrated()
     fields, _ = obj.prepare(metadata(), np.full(8, 2.0), step=2, ready=True,
@@ -221,6 +309,40 @@ def test_resume_reproduces_caps_ema_ramp_and_next_gate():
     for key in expected:
         np.testing.assert_array_equal(actual[key], expected[key])
     assert actual_metrics == expected_metrics
+
+
+def test_resume_preserves_independent_role_ramps_and_paused_role():
+    obj = calibrated_both_roles(ramp_steps=4)
+    obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=2, ready=True)
+    obj.prepare(metadata(), np.full(8, 2.0), step=3, ready=True)
+    resumed = controller(ramp_steps=4)
+    resumed.load_state_dict(json.loads(json.dumps(obj.state_dict())))
+    expected, expected_metrics = obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=4, ready=True)
+    actual, actual_metrics = resumed.prepare(both_roles_metadata(), np.full(16, 2.0), step=4, ready=True)
+    for key in expected:
+        np.testing.assert_array_equal(actual[key], expected[key])
+    assert actual_metrics == expected_metrics
+    np.testing.assert_allclose(actual["entropy_control_weight"][:8], .75)
+    np.testing.assert_allclose(actual["entropy_control_weight"][8:], .5)
+
+
+def test_version_one_resume_preserves_caps_and_trends_but_restarts_unrecoverable_role_ramps():
+    obj = calibrated_both_roles(ramp_steps=4)
+    for step in range(2, 6):
+        obj.prepare(both_roles_metadata(), np.full(16, 2.0), step=step, ready=True)
+    old_state = json.loads(json.dumps(obj.state_dict()))
+    old_state["version"] = 1
+    old_state.pop("role_ramps")
+    resumed = controller(ramp_steps=4)
+    resumed.load_state_dict(old_state)
+    assert resumed.groups == obj.groups
+    assert resumed.last_step == obj.last_step
+    assert not resumed.role_ramps
+    fields, metrics = resumed.prepare(both_roles_metadata(), np.full(16, 2.0), step=6, ready=True)
+    np.testing.assert_allclose(fields["entropy_control_weight"], .25)
+    assert metrics["entropy_control/Solver Agent/qualified_updates"] == 1
+    assert metrics["entropy_control/Verifier Agent/qualified_updates"] == 1
+    assert resumed.state_dict()["version"] == 2
 
 
 def test_resume_rejects_incompatible_scales_and_duplicate_step():

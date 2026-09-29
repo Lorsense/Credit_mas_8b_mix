@@ -313,6 +313,8 @@ algorithm:
       model_path: null
       revision: null
       initial_checkpoint: null
+      initialization_mode: qualified # candidate imports learned weights; semantic_only rechecks cached semantic quality.
+      prediction_mode: entropy_aware # semantic_only independently qualifies and trains the semantic branch.
       require_pretrained: True
       allow_missing_resume: False
       device: cuda:0
@@ -341,6 +343,12 @@ algorithm:
       min_val_auc: 0.55
       min_brier_improvement: 0.0
       candidate_brier_tolerance: 0.0
+      # Semantic-only deployment: per-role valid, nonterminal after-action scope.
+      semantic_min_val_prefixes: 32
+      semantic_min_val_questions: 8
+      semantic_min_val_per_class: 8 # Different successful/failed trajectories, not prefix counts.
+      semantic_min_val_auc: 0.55
+      semantic_min_brier_improvement: 0.0
       min_entropy_brier_gain: 0.0
       min_temporal_brier_gain: 0.0
       min_entropy_val_prefixes: 32
@@ -353,6 +361,8 @@ algorithm:
       cpu_num_threads: 1
     control:
       enabled: False
+      prediction_mode: entropy_aware # Must match value.prediction_mode.
+      semantic_strength: 0.25 # [0,1]; 1.0 gives four times the default gate with other factors fixed.
       fast_beta: 0.9
       slow_beta: 0.99
       cap_margin: 0.2

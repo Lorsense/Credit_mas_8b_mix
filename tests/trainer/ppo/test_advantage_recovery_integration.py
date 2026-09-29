@@ -250,7 +250,8 @@ def test_curriculum_rejects_one_trajectory_mapped_to_different_dataset_questions
     assert not observed
 
 
-def test_value_scoring_keeps_all_records_but_only_random_fresh_slice_can_train():
+@pytest.mark.parametrize("prediction_mode", ["entropy_aware", "semantic_only"])
+def test_value_scoring_keeps_all_records_but_only_random_fresh_slice_can_train(prediction_mode):
     h = helpers()
     batch = fixture((0, 1), turns=2)
     batch.non_tensor_batch["curriculum_source"] = np.array(["hard", "hard", "fresh", "fresh"])
@@ -263,11 +264,12 @@ def test_value_scoring_keeps_all_records_but_only_random_fresh_slice_can_train()
                 "metrics": {"version": 5}, "reliability": {"solver": .8}}
 
     h["_prepare_value_credit"].__globals__.update(
-        build_trajectory_records=lambda metadata, turns: (deepcopy(records), {}),
+        build_trajectory_records=lambda metadata, turns, prediction_mode: (deepcopy(records), {}),
         ray=SimpleNamespace(get=lambda result: result),
-        attach_value_predictions=lambda metadata, values, ready: {"score_count": len(values)})
-    self = SimpleNamespace(question_curriculum=object(), config=SimpleNamespace(agent=SimpleNamespace(
-        orchestra=SimpleNamespace(math=SimpleNamespace(max_loop_num=3)))),
+        attach_value_predictions=lambda metadata, values, ready, prediction_mode: {"score_count": len(values)})
+    self = SimpleNamespace(question_curriculum=object(), config=SimpleNamespace(
+        algorithm=SimpleNamespace(entropy_credit=SimpleNamespace(value={"prediction_mode": prediction_mode})),
+        agent=SimpleNamespace(orchestra=SimpleNamespace(math=SimpleNamespace(max_loop_num=3)))),
         value_scorer=SimpleNamespace(prepare=SimpleNamespace(remote=prepare)))
     metrics = h["_prepare_value_credit"](self, batch)
     assert received == [{"traj_uid": "t0", "train_eligible": False}, {"traj_uid": "t1", "train_eligible": True}]

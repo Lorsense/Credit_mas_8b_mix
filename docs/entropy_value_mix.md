@@ -1,5 +1,7 @@
 # mix：pure 信用分配与熵感知价值监督
 
+离线候选未通过熵资格、希望先启动在线学习时，使用新增的 `VALUE_INIT_MODE=candidate`，见[候选初始化与 16 卡训练流程](candidate_value_training.md)。这不会把未合格模型标为 ready。
+
 本版本修改 `Credit_mas_mix`。`credit_mas_pure`、`credit_mas_sup` 作为参考项目保留。
 实现范围为 Math 的 Solver/Verifier、GRPO、FSDP 和 SGLang。
 

@@ -82,8 +82,11 @@ def bash_path():
     return candidate
 
 
-@pytest.mark.parametrize("nodes,mode", [(1, "train"), (2, "train"), (1, "eval"), (2, "eval")])
-def test_launcher_dry_run_and_hydra_config(tmp_path, nodes, mode):
+@pytest.mark.parametrize("nodes,mode", [(1, "train"), (2, "train"), (1, "eval"), (2, "eval"),
+                                      (1, "resume"), (2, "resume")])
+@pytest.mark.parametrize("initialization", ["qualified", "candidate"])
+@pytest.mark.parametrize("prediction_mode", ["entropy_aware", "semantic_only"])
+def test_launcher_dry_run_and_hydra_config(tmp_path, nodes, mode, initialization, prediction_mode):
     hydra = pytest.importorskip("hydra")
     from omegaconf import OmegaConf
     data = tmp_path / "data with spaces.parquet"
@@ -92,10 +95,14 @@ def test_launcher_dry_run_and_hydra_config(tmp_path, nodes, mode):
     value.touch()
     resume = tmp_path / "global_step_50"
     resume.mkdir()
+    (resume / "prefix_value.pt").touch()
+    (resume / "entropy_controller.json").touch()
     env = {**os.environ, "NNODES": str(nodes), "RAY_ADDRESS": "auto", "DRY_RUN": "1",
-           "VALUE_CHECKPOINT": value.as_posix(), "TRAIN_DATA": data.as_posix(), "VAL_DATA": data.as_posix(),
-           "RESUME_FROM": resume.as_posix() if mode == "eval" else "", "TRAIN_BATCH_SIZE": "30", "GROUP_SIZE": "8"}
-    result = subprocess.run([bash_path(), "examples/drmas_trainer/run_math_16gpu.sh", mode],
+           "VALUE_CHECKPOINT": value.as_posix() if mode == "train" else "", "VALUE_INIT_MODE": initialization,
+           "VALUE_PREDICTION_MODE": prediction_mode, "SEMANTIC_CONTROL_STRENGTH": "0.5",
+           "TRAIN_DATA": data.as_posix(), "VAL_DATA": data.as_posix(),
+           "RESUME_FROM": resume.as_posix() if mode != "train" else "", "TRAIN_BATCH_SIZE": "30", "GROUP_SIZE": "8"}
+    result = subprocess.run([bash_path(), "examples/drmas_trainer/run_math_16gpu.sh", "train" if mode == "resume" else mode],
                             cwd=ROOT, env=env, capture_output=True, text=True, check=True)
     arguments = shlex.split(result.stdout.strip())
     assert arguments[:3] == ["python3", "-m", "verl.trainer.main_ppo"]
@@ -107,6 +114,14 @@ def test_launcher_dry_run_and_hydra_config(tmp_path, nodes, mode):
     assert cfg.trainer.val_only == (mode == "eval")
     assert cfg.actor_rollout_ref.rollout.tensor_model_parallel_size == 1
     assert cfg.algorithm.entropy_credit.sparse.enable and cfg.algorithm.entropy_credit.control.enabled
+    assert cfg.algorithm.entropy_credit.value.initialization_mode == initialization
+    assert cfg.algorithm.entropy_credit.value.prediction_mode == prediction_mode
+    assert cfg.algorithm.entropy_credit.control.prediction_mode == prediction_mode
+    assert cfg.algorithm.entropy_credit.control.semantic_strength == 0.5
+    assert cfg.algorithm.entropy_credit.value.semantic_min_val_prefixes == 32
+    assert cfg.algorithm.entropy_credit.value.semantic_min_val_questions == 8
+    assert cfg.algorithm.entropy_credit.value.semantic_min_val_per_class == 8
+    assert cfg.algorithm.entropy_credit.value.require_pretrained
     assert cfg.algorithm.advantage_recovery.enable
     assert cfg.algorithm.advantage_recovery.curriculum.enabled
     assert cfg.actor_rollout_ref.actor.advantage_recovery.enable
@@ -136,9 +151,84 @@ def test_launcher_dry_run_and_hydra_config(tmp_path, nodes, mode):
     for micro in cfg.agent.agent_specific_parameters.actor.ppo_micro_batch_size_per_gpu:
         assert local_mini > 0 and local_mini % micro == 0
     assert cfg.data.train_files == data.as_posix()
-    if mode == "eval":
+    if mode != "train":
         assert cfg.algorithm.entropy_credit.value.initial_checkpoint is None
         assert cfg.trainer.resume_from_path == resume.as_posix()
+    else:
+        assert cfg.algorithm.entropy_credit.value.initial_checkpoint == value.as_posix()
+
+
+def test_launcher_rejects_unknown_initialization_before_starting_ray():
+    result = subprocess.run([bash_path(), "examples/drmas_trainer/run_math_16gpu.sh", "train"],
+                            cwd=ROOT, env={**os.environ, "NNODES": "1", "VALUE_INIT_MODE": "bypass"},
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "VALUE_INIT_MODE must be qualified or candidate" in result.stderr
+
+
+@pytest.mark.parametrize("name,value,message", [
+    ("VALUE_PREDICTION_MODE", "semantic", "VALUE_PREDICTION_MODE"),
+    ("SEMANTIC_CONTROL_STRENGTH", "nan", "SEMANTIC_CONTROL_STRENGTH"),
+    ("SEMANTIC_CONTROL_STRENGTH", "inf", "SEMANTIC_CONTROL_STRENGTH"),
+    ("SEMANTIC_CONTROL_STRENGTH", "1e999", "SEMANTIC_CONTROL_STRENGTH"),
+    ("SEMANTIC_CONTROL_STRENGTH", "-0.1", "SEMANTIC_CONTROL_STRENGTH"),
+    ("SEMANTIC_CONTROL_STRENGTH", "1.001", "SEMANTIC_CONTROL_STRENGTH"),
+    ("SEMANTIC_CONTROL_STRENGTH", "true", "SEMANTIC_CONTROL_STRENGTH"),
+])
+def test_launcher_rejects_invalid_semantic_configuration_before_ray(name, value, message):
+    env = {**os.environ, "NNODES": "1", "VALUE_INIT_MODE": "candidate",
+           "VALUE_PREDICTION_MODE": "semantic_only", "SEMANTIC_CONTROL_STRENGTH": "0.25", name: value}
+    result = subprocess.run([bash_path(), "examples/drmas_trainer/run_math_16gpu.sh", "train"],
+                            cwd=ROOT, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def prediction_validator():
+    path = ROOT / "verl/trainer/ppo/ray_trainer.py"
+    source = ast.parse(path.read_text(encoding="utf-8"))
+    fn = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "validate_value_control_modes")
+    import math
+    namespace = {"np": SimpleNamespace(isfinite=math.isfinite)}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[fn.name]
+
+
+@pytest.mark.parametrize("value,control", [
+    ({"prediction_mode": "semantic_only"}, {"prediction_mode": "entropy_aware"}),
+    ({"prediction_mode": "invalid"}, {"prediction_mode": "invalid"}),
+    ({}, {"semantic_strength": float("nan")}),
+    ({}, {"semantic_strength": float("inf")}),
+    ({}, {"semantic_strength": -0.01}),
+    ({}, {"semantic_strength": 1.01}),
+    ({}, {"semantic_strength": None}),
+])
+def test_prediction_mode_validation_rejects_bad_config(value, control):
+    with pytest.raises(ValueError):
+        prediction_validator()(value, control)
+
+
+def test_prediction_mode_validation_defaults_and_strength_endpoints():
+    validate = prediction_validator()
+    validate({}, {})
+    for strength in (0, 0.25, 1):
+        validate({"prediction_mode": "semantic_only"},
+                 {"prediction_mode": "semantic_only", "semantic_strength": strength})
+
+
+def test_prediction_configuration_is_checked_before_ray_initialization():
+    path = ROOT / "verl/trainer/main_ppo.py"
+    source = ast.parse(path.read_text(encoding="utf-8"))
+    fn = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "run_ppo")
+    events = []
+    namespace = {"validate_value_control_modes": prediction_validator(),
+                 "ray": SimpleNamespace(is_initialized=lambda: events.append("ray"))}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
+    config = SimpleNamespace(algorithm={"entropy_credit": {
+        "value": {"prediction_mode": "semantic_only"}, "control": {"prediction_mode": "entropy_aware"}}})
+    with pytest.raises(ValueError, match="must agree"):
+        namespace[fn.name](config)
+    assert not events
 
 
 def test_ray_cpu_preflight_accounts_for_value_and_coordinator():

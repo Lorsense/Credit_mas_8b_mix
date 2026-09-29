@@ -21,6 +21,25 @@ SOLVER_MODEL=${SOLVER_MODEL:-Qwen/Qwen3-4B}
 VERIFIER_MODEL=${VERIFIER_MODEL:-Qwen/Qwen3-4B}
 VALUE_ENCODER=${VALUE_ENCODER:-Qwen/Qwen3-4B}
 VALUE_CHECKPOINT=${VALUE_CHECKPOINT:-}
+# qualified: require matching deployment eligibility; candidate: import learned weights.
+# semantic_only+candidate first rechecks cached semantic quality, then learns online.
+VALUE_INIT_MODE=${VALUE_INIT_MODE:-qualified}
+case "$VALUE_INIT_MODE" in
+  qualified|candidate) ;;
+  *) echo 'VALUE_INIT_MODE must be qualified or candidate.' >&2; exit 1 ;;
+esac
+VALUE_PREDICTION_MODE=${VALUE_PREDICTION_MODE:-entropy_aware}
+case "$VALUE_PREDICTION_MODE" in
+  entropy_aware|semantic_only) ;;
+  *) echo 'VALUE_PREDICTION_MODE must be entropy_aware or semantic_only.' >&2; exit 1 ;;
+esac
+SEMANTIC_CONTROL_STRENGTH=${SEMANTIC_CONTROL_STRENGTH:-0.25}
+if ! awk -v value="$SEMANTIC_CONTROL_STRENGTH" 'BEGIN {
+  if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1;
+  if (value + 0 < 0 || value + 0 > 1) exit 1;
+}'; then
+  echo 'SEMANTIC_CONTROL_STRENGTH must be finite and in [0,1].' >&2; exit 1
+fi
 RESUME_FROM=${RESUME_FROM:-}
 TRAIN_DATA=${TRAIN_DATA:-$HOME/data/drmas_math/train.parquet}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-30}
@@ -46,7 +65,7 @@ if [[ "$MODE" == train ]]; then
   VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-110}
   VAL_GROUP_SIZE=${VAL_GROUP_SIZE:-1}
   if [[ -z "$RESUME_FROM" ]]; then
-    : "${VALUE_CHECKPOINT:?Set VALUE_CHECKPOINT to an entropy-qualified offline prefix_value.pt}"
+    : "${VALUE_CHECKPOINT:?Set VALUE_CHECKPOINT to prefix_value.pt; use VALUE_INIT_MODE=candidate for unqualified weights}"
     [[ -f "$VALUE_CHECKPOINT" ]] || { echo "Missing VALUE_CHECKPOINT: $VALUE_CHECKPOINT" >&2; exit 1; }
     INITIAL_CHECKPOINT="$VALUE_CHECKPOINT"
   else
@@ -72,6 +91,10 @@ args=(
   algorithm.entropy_credit.value.enable=True algorithm.entropy_credit.control.enabled=True
   "algorithm.entropy_credit.value.model_path=$VALUE_ENCODER"
   "algorithm.entropy_credit.value.initial_checkpoint=$INITIAL_CHECKPOINT"
+  "algorithm.entropy_credit.value.initialization_mode=$VALUE_INIT_MODE"
+  "algorithm.entropy_credit.value.prediction_mode=$VALUE_PREDICTION_MODE"
+  "algorithm.entropy_credit.control.prediction_mode=$VALUE_PREDICTION_MODE"
+  "algorithm.entropy_credit.control.semantic_strength=$SEMANTIC_CONTROL_STRENGTH"
   algorithm.entropy_credit.value.device=cuda:0
   algorithm.entropy_credit.value.require_pretrained=True
   "data.train_files=$TRAIN_DATA" "data.val_files=$VAL_DATA"

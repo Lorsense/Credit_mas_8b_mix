@@ -147,7 +147,7 @@ def _row_count(batch: Mapping[str, Sequence[Any]]) -> int:
 
 
 def _collect_trajectories(
-    batch: Mapping[str, Sequence[Any]], max_solver_turns: int | None
+    batch: Mapping[str, Sequence[Any]], max_solver_turns: int | None, *, include_entropy: bool = True
 ) -> tuple[list[dict[str, Any]], dict[str, float | int]]:
     """Validate whole trajectories before exposing any of their prefixes."""
     size = _row_count(batch)
@@ -206,8 +206,10 @@ def _collect_trajectories(
                     "text": batch["value_action_text"][row],
                     "valid": _binary(batch["is_action_valid"][row]),
                     "role_turn_index": _integer(batch["role_turn_index"][row]),
-                    "entropy_mean": _optional_float(batch.get("top16_entropy_mean", [None] * size)[row]),
-                    "entropy_coverage": _coverage(batch.get("top16_entropy", [None] * size)[row]),
+                    "entropy_mean": (_optional_float(batch.get("top16_entropy_mean", [None] * size)[row])
+                                     if include_entropy else None),
+                    "entropy_coverage": (_coverage(batch.get("top16_entropy", [None] * size)[row])
+                                         if include_entropy else None),
                     "entropy_token_count": _optional_float(batch.get("pure_entropy_response_tokens", [None] * size)[row]),
                     "truncated": _binary(batch.get("pure_entropy_truncated", [False] * size)[row]),
                 }
@@ -262,7 +264,8 @@ def _collect_trajectories(
 
 
 def build_trajectory_records(
-    non_tensor_batch: Mapping[str, Sequence[Any]], max_solver_turns: int | None = None
+    non_tensor_batch: Mapping[str, Sequence[Any]], max_solver_turns: int | None = None,
+    prediction_mode: str = "entropy_aware",
 ) -> tuple[list[dict[str, Any]], dict[str, float | int]]:
     """Reconstruct chronological scorer records; never deduplicate by text.
 
@@ -274,26 +277,37 @@ def build_trajectory_records(
     New logs carrying value_max_solver_turns must match the explicit budget
     and must end exactly where the Math controller would stop. Legacy logs
     without that field retain structural-only validation for compatibility.
+    Semantic-only records do not parse unused Top-16 entropy statistics; actual
+    response token counts and action validity remain required control metadata.
     """
+    if prediction_mode not in ("entropy_aware", "semantic_only"):
+        raise ValueError("unsupported value prediction_mode")
     turns = None if max_solver_turns is None else _integer(max_solver_turns)
     if turns == 0:
         raise ValueError("max_solver_turns must be positive")
-    return _collect_trajectories(non_tensor_batch, turns)
+    return _collect_trajectories(non_tensor_batch, turns, include_entropy=prediction_mode != "semantic_only")
 
 
-def attach_value_predictions(non_tensor_batch, values, ready):
+def attach_value_predictions(non_tensor_batch, values, ready, prediction_mode="entropy_aware"):
     """Attach probability deltas without modifying any pure credit coefficient.
 
     Predictions may stop at the last complete encodable prefix. An invalid or
     truncated action is masked locally; its text remains in later contexts.
-    Each prefix prediction has sem/abs/full and entropy availability flags.
+    Entropy-aware predictions have sem/abs/full and entropy availability flags.
+    Semantic-only predictions require only sem and explicit semantic flags. The
+    legacy credit fields alias the selected control source, which is recorded;
+    they are never used to alter GRPO advantages or pure credit coefficients.
     """
+    if prediction_mode not in ("entropy_aware", "semantic_only"):
+        raise ValueError("unsupported value prediction_mode")
+    semantic_only = prediction_mode == "semantic_only"
     size = _row_count(non_tensor_batch)
     arrays = {f"value_{branch}_{side}": np.full(size, np.nan)
               for branch in ("sem", "abs", "full") for side in ("before", "after")}
     available, entropy_available = np.zeros(size, bool), np.zeros(size, bool)
+    semantic_available = np.zeros(size, bool)
     delta, entropy_delta = np.zeros(size), np.zeros(size)
-    records, metrics = _collect_trajectories(non_tensor_batch, None)
+    records, metrics = _collect_trajectories(non_tensor_batch, None, include_entropy=not semantic_only)
     record_map = {r["traj_uid"]: r for r in records}
     for row, trajectory in enumerate(non_tensor_batch.get("traj_uid", [])):
         record = record_map.get(str(trajectory))
@@ -306,6 +320,25 @@ def attach_value_predictions(non_tensor_batch, values, ready):
             continue
         try:
             before, after = prediction[index], prediction[index + 1]
+            if semantic_only:
+                # Nonterminal control requires both complete encoded prefixes.
+                # Initial may be the before prefix; a terminal after prediction
+                # is still never a control object, even if a faulty scorer flags it.
+                if (index == len(record["actions"]) - 1
+                        or not bool(before.get("semantic_available", False))
+                        or not bool(after.get("action_semantic_available", False))
+                        or not bool(after.get("semantic_available", False))
+                        or not (action.get("entropy_token_count") is not None
+                                and action["entropy_token_count"] > 0)):
+                    continue
+                sem_before, sem_after = float(before["sem"]), float(after["sem"])
+                if not all(math.isfinite(x) and 0 <= x <= 1 for x in (sem_before, sem_after)):
+                    continue
+                arrays["value_sem_before"][row] = sem_before
+                arrays["value_sem_after"][row] = sem_after
+                delta[row] = sem_after - sem_before
+                available[row] = semantic_available[row] = True
+                continue
             numbers_ = [float(p[branch]) for p in (before, after) for branch in ("sem", "abs", "full")]
             if not all(math.isfinite(x) and 0 <= x <= 1 for x in numbers_):
                 continue
@@ -319,14 +352,23 @@ def attach_value_predictions(non_tensor_batch, values, ready):
         except (KeyError, TypeError, ValueError):
             continue
     non_tensor_batch.update(arrays)
-    non_tensor_batch["value_credit_before"] = arrays["value_full_before"]
-    non_tensor_batch["value_credit_after"] = arrays["value_full_after"]
+    branch = "sem" if semantic_only else "full"
+    non_tensor_batch["control_value_before"] = arrays[f"value_{branch}_before"]
+    non_tensor_batch["control_value_after"] = arrays[f"value_{branch}_after"]
+    non_tensor_batch["control_delta"] = delta
+    non_tensor_batch["control_available"] = available
+    non_tensor_batch["value_prediction_source"] = np.full(size, prediction_mode, dtype=object)
+    non_tensor_batch["value_credit_before"] = arrays[f"value_{branch}_before"]
+    non_tensor_batch["value_credit_after"] = arrays[f"value_{branch}_after"]
     non_tensor_batch["value_credit_delta"] = delta
     non_tensor_batch["value_entropy_delta"] = entropy_delta
     non_tensor_batch["value_credit_available"] = available
-    non_tensor_batch["value_absolute_available"] = available.copy()
+    non_tensor_batch["value_absolute_available"] = np.zeros(size, bool) if semantic_only else available.copy()
+    non_tensor_batch["value_semantic_available"] = semantic_available
     non_tensor_batch["value_entropy_available"] = entropy_available
     metrics.update({"value_credit/scorer_ready": int(bool(ready)),
+                    "value_credit/prediction_source_semantic_only": int(semantic_only),
+                    "value_credit/semantic_prediction_coverage": float(semantic_available.mean()) if size else 0.0,
                     "value_credit/prediction_available_rows": int(available.sum()),
                     "value_credit/prediction_coverage": float(available.mean()) if size else 0.0,
                     "value_credit/temporal_coverage": float(entropy_available.mean()) if size else 0.0})

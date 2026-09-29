@@ -338,9 +338,15 @@ class DataParallelPPOActor(BasePPOActor):
         entropy_control_config = self.config.get("entropy_control", {})
         entropy_control_enabled = bool(entropy_control_config.get("enabled", False))
         entropy_control_coef = float(entropy_control_config.get("loss_coef", 0.01))
+        entropy_control_mode = data.meta_info.get("entropy_control_prediction_mode", "entropy_aware")
+        semantic_control_strength = float(data.meta_info.get("entropy_control_semantic_strength", 0.25))
         if entropy_control_enabled:
             if not 0 <= entropy_control_coef < float("inf"):
                 raise ValueError("actor entropy_control.loss_coef must be finite and nonnegative")
+            if entropy_control_mode not in ("entropy_aware", "semantic_only"):
+                raise ValueError("actor entropy control received an unsupported prediction mode")
+            if not 0 <= semantic_control_strength <= 1:
+                raise ValueError("actor entropy control semantic_strength must be finite and lie in [0, 1]")
             control_keys = ["entropy_control_weight", "entropy_control_cap", "entropy_control_valid"]
             missing = [key for key in control_keys if key not in data.batch]
             if missing:
@@ -372,6 +378,12 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        if entropy_control_enabled:
+            append_to_dict(metrics, {
+                f"actor/{wg_id}/entropy_control/loss_coef": entropy_control_coef,
+                f"actor/{wg_id}/entropy_control/prediction_source_semantic_only": float(entropy_control_mode == "semantic_only"),
+                f"actor/{wg_id}/entropy_control/semantic_strength": semantic_control_strength,
+            })
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -514,6 +526,10 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
 
                     if control_metrics is not None:
+                        if entropy_control_mode == "semantic_only":
+                            # An observability alias of the existing hinge;
+                            # its coefficient and backward are applied once above.
+                            control_metrics["semantic_hinge_loss"] = control_metrics["hinge_loss"]
                         append_to_dict(metrics, {
                             f"actor/{wg_id}/entropy_control/{key}": value.item()
                             for key, value in control_metrics.items()
